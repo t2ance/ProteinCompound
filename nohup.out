@@ -1,0 +1,65 @@
+wandb: Currently logged in as: t2ance (pqin) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: setting up run rv94izr0
+wandb: Tracking run with wandb version 0.22.2
+wandb: Run data is saved locally in /data2/peijia/projects/ProteinCompound/wandb/run-20251220_172737-rv94izr0
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run super-lion-42
+wandb: ⭐️ View project at https://wandb.ai/pqin/protein-compound
+wandb: 🚀 View run at https://wandb.ai/pqin/protein-compound/runs/rv94izr0
+loading_esm_model=esm2_t33_650M_UR50D (hub/cache)
+Traceback (most recent call last):
+  File "main.py", line 1230, in <module>
+    main()
+  File "main.py", line 1032, in main
+    model = build_model(
+  File "main.py", line 851, in build_model
+    protein_encoder = ProteinEncoderESM(
+  File "main.py", line 356, in __init__
+    self.model, self.alphabet = _load_esm(
+  File "main.py", line 43, in _load_esm
+    model, alphabet = getattr(esm.pretrained, model_name)()
+  File "/data2/peijia/projects/ProteinCompound/external/esm/esm/pretrained.py", line 379, in esm2_t33_650M_UR50D
+    return load_model_and_alphabet_hub("esm2_t33_650M_UR50D")
+  File "/data2/peijia/projects/ProteinCompound/external/esm/esm/pretrained.py", line 64, in load_model_and_alphabet_hub
+    return load_model_and_alphabet_core(model_name, model_data, regression_data)
+  File "/data2/peijia/projects/ProteinCompound/external/esm/esm/pretrained.py", line 191, in load_model_and_alphabet_core
+    model, alphabet, model_state = _load_model_and_alphabet_core_v2(model_data)
+  File "/data2/peijia/projects/ProteinCompound/external/esm/esm/pretrained.py", line 176, in _load_model_and_alphabet_core_v2
+    model = ESM2(
+  File "/data2/peijia/projects/ProteinCompound/external/esm/esm/model/esm2.py", line 39, in __init__
+    self._init_submodules()
+  File "/data2/peijia/projects/ProteinCompound/external/esm/esm/model/esm2.py", line 50, in _init_submodules
+    [
+  File "/data2/peijia/projects/ProteinCompound/external/esm/esm/model/esm2.py", line 51, in <listcomp>
+    TransformerLayer(
+  File "/data2/peijia/projects/ProteinCompound/external/esm/esm/modules.py", line 101, in __init__
+    self._init_submodules(add_bias_kv, use_esm1b_layer_norm)
+  File "/data2/peijia/projects/ProteinCompound/external/esm/esm/modules.py", line 106, in _init_submodules
+    self.self_attn = MultiheadAttention(
+  File "/data2/peijia/projects/ProteinCompound/external/esm/esm/multihead_attention.py", line 123, in __init__
+    self.reset_parameters()
+  File "/data2/peijia/projects/ProteinCompound/external/esm/esm/multihead_attention.py", line 151, in reset_parameters
+    nn.init.xavier_uniform_(self.out_proj.weight)
+  File "/home/peijia/miniconda3/envs/drugrna/lib/python3.8/site-packages/torch/nn/init.py", line 363, in xavier_uniform_
+    return _no_grad_uniform_(tensor, -a, a, generator)
+  File "/home/peijia/miniconda3/envs/drugrna/lib/python3.8/site-packages/torch/nn/init.py", line 16, in _no_grad_uniform_
+    return tensor.uniform_(a, b, generator=generator)
+KeyboardInterrupt
+Error in atexit._run_exitfuncs:
+Traceback (most recent call last):
+  File "/home/peijia/miniconda3/envs/drugrna/lib/python3.8/subprocess.py", line 1083, in wait
+socket.send() raised exception.
+[1;34mwandb[0m: 
+[1;34mwandb[0m: 🚀 View run [33msuper-lion-42[0m at: [34m[0m
+[1;34mwandb[0m: Find logs at: [1;35m../../../../data2/peijia/projects/ProteinCompound/wandb/run-20251220_172737-rv94izr0/logs[0m
+
+socket.send() raised exception.
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/peijia/miniconda3/envs/drugrna/lib/python3.8/subprocess.py", line 1096, in wait
+    self._wait(timeout=sigint_timeout)
+  File "/home/peijia/miniconda3/envs/drugrna/lib/python3.8/subprocess.py", line 1816, in _wait
+    time.sleep(delay)
+KeyboardInterrupt
