@@ -9,7 +9,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, random_split
 from contextlib import nullcontext
-
+import wandb
+from tqdm import tqdm
 def _ensure_repo_path(repo_root: str, label: str) -> None:
     if not repo_root:
         raise ValueError(f"{label} is required.")
@@ -191,12 +192,14 @@ def train_epoch(
     amp_mode: str,
     scaler: Optional[torch.cuda.amp.GradScaler],
     accumulation_steps: int = 1,
+    debug: bool = False,
+    wandb_run: Optional[wandb.Run] = None,
 ) -> float:
     model.train()
     total_loss = 0.0
     loss_fn = nn.BCEWithLogitsLoss()
     optimizer.zero_grad(set_to_none=True)
-    for batch_idx, (rna, smiles, labels) in enumerate(loader):
+    for batch_idx, (rna, smiles, labels) in tqdm(enumerate(loader), total=len(loader), desc="Training"):
         labels = labels.to(device)
         with _amp_context(device, amp_mode):
             logits = model(rna, smiles, device=device)
@@ -206,15 +209,80 @@ def train_epoch(
         else:
             loss.backward()
         total_loss += loss.item() * labels.size(0)
+
+        # Log batch loss to wandb
+        if wandb_run is not None:
+            wandb_run.log({"train/batch_loss": loss.item()})
+
+        # Memory monitoring (log every 10 batches or when debugging)
+        if (batch_idx % 10 == 0 or debug) and device.type == "cuda":
+            mem_allocated = torch.cuda.memory_allocated(device) / 1024**3
+            mem_reserved = torch.cuda.memory_reserved(device) / 1024**3
+            mem_free = (torch.cuda.get_device_properties(device).total_memory
+                        - torch.cuda.memory_allocated(device)) / 1024**3
+            print(f"batch={batch_idx} "
+                  f"loss={loss.item():.4f} "
+                  f"mem_allocated={mem_allocated:.2f}GB "
+                  f"mem_reserved={mem_reserved:.2f}GB "
+                  f"mem_free={mem_free:.2f}GB", flush=True)
+
+            # Peak memory tracking
+            if batch_idx == 0:
+                torch.cuda.reset_peak_memory_stats(device)
+
+            mem_peak = torch.cuda.max_memory_allocated(device) / 1024**3
+            print(f"mem_peak_so_far={mem_peak:.2f}GB", flush=True)
+
+        if debug and batch_idx == 0:
+            print(f"\n=== Debug Info Batch {batch_idx} ===")
+            print(f"Loss: {loss.item():.4f}")
+            lora_grads = []
+            for name, param in model.named_parameters():
+                if param.requires_grad and param.grad is not None:
+                    grad_norm = param.grad.norm().item()
+                    if 'lora' in name.lower():
+                        lora_grads.append((name, grad_norm))
+                    if grad_norm > 0:
+                        print(f"{name}: grad_norm={grad_norm:.6f}")
+            if lora_grads:
+                print(f"\n=== LoRA gradients found: {len(lora_grads)} ===")
+            else:
+                print(f"\n=== WARNING: No LoRA gradients! ===")
+
         is_last_batch = (batch_idx + 1) == len(loader)
         should_update = ((batch_idx + 1) % accumulation_steps == 0) or is_last_batch
         if should_update:
+            # Compute gradient norm before optimizer step
+            if scaler is not None:
+                scaler.unscale_(optimizer)
+
+            total_norm = 0.0
+            for p in model.parameters():
+                if p.grad is not None:
+                    param_norm = p.grad.data.norm(2)
+                    total_norm += param_norm.item() ** 2
+            grad_norm = total_norm ** 0.5
+
+            # Log gradient norm to wandb
+            if wandb_run is not None:
+                wandb_run.log({"train/grad_norm": grad_norm})
+
+            # Print gradient norm periodically
+            if batch_idx % 10 == 0:
+                print(f"batch={batch_idx} grad_norm={grad_norm:.4f}", flush=True)
+
+            # Optimizer step
             if scaler is not None:
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+
+            # Clear CUDA cache after optimizer step to prevent fragmentation
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
     return total_loss / max(len(loader.dataset), 1)
 
 
@@ -230,7 +298,7 @@ def evaluate(
     all_probs = []
     all_labels = []
     with torch.no_grad():
-        for rna, smiles, labels in loader:
+        for rna, smiles, labels in tqdm(loader, total=len(loader), desc="Evaluating"):
             labels = labels.to(device)
             with _amp_context(device, amp_mode):
                 logits = model(rna, smiles, device=device)
@@ -275,7 +343,11 @@ class ProteinEncoderESM(nn.Module):
         data = [(str(i), seq) for i, seq in enumerate(sequences)]
         _, _, tokens = self.batch_converter(data)
         tokens = tokens.to(device)
-        with torch.no_grad() if self.freeze else torch.enable_grad():
+        if self.freeze:
+            with torch.no_grad():
+                out = self.model(tokens, repr_layers=[
+                                 self.repr_layer], return_contacts=False)
+        else:
             out = self.model(tokens, repr_layers=[
                              self.repr_layer], return_contacts=False)
         reps = out["representations"][self.repr_layer]
@@ -330,13 +402,72 @@ class DrugChatCompoundEncoder(nn.Module):
         self.embedding_dim = emb_dim
         self.freeze = freeze
 
-    def forward(self, smiles_list: List[str], device: torch.device) -> torch.Tensor:
+    def enable_gradient_checkpointing(self):
+        """Enable gradient checkpointing for GNN to save memory."""
+        if getattr(self.gnn, "_gc_wrapped", False):
+            return
+
+        original_forward = self.gnn.forward
+
+        def checkpointed_forward(x, edge_index, edge_attr):
+            if not self.gnn.training:
+                return original_forward(x, edge_index, edge_attr)
+
+            def forward_fn(x_input, edge_index_input, edge_attr_input):
+                return original_forward(x_input, edge_index_input, edge_attr_input)
+
+            return torch.utils.checkpoint.checkpoint(
+                forward_fn,
+                x, edge_index, edge_attr,
+                use_reentrant=False
+            )
+
+        self.gnn.forward = checkpointed_forward
+        self.gnn._gc_wrapped = True
+        print("grad_checkpointing=enabled_for_gnn", flush=True)
+
+    def forward(self, smiles_list: List[str], device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
         batch = _smiles_to_batch(smiles_list).to(device)
         if self.freeze:
             self.gnn.eval()
-        with torch.no_grad() if self.freeze else torch.enable_grad():
-            feats = self.gnn(batch)
-        return feats.unsqueeze(1)
+
+        # Get node-level features (before pooling)
+        if self.freeze:
+            with torch.no_grad():
+                node_feats = self.gnn.gnn(batch.x, batch.edge_index, batch.edge_attr)
+        else:
+            node_feats = self.gnn.gnn(batch.x, batch.edge_index, batch.edge_attr)
+
+        # Convert to batched format with padding
+        batch_size = batch.batch.max().item() + 1
+        max_nodes = max((batch.batch == i).sum().item() for i in range(batch_size))
+
+        # Create padded tensor [batch, max_nodes, emb_dim] using node_feats device
+        padded_feats = torch.zeros(
+            batch_size, max_nodes, node_feats.size(1),
+            device=node_feats.device,  # Use node_feats.device directly
+            dtype=node_feats.dtype,
+            pin_memory=False
+        )
+        padding_mask = torch.ones(
+            batch_size, max_nodes,
+            device=node_feats.device,
+            dtype=torch.bool,
+            pin_memory=False
+        )
+
+        # Fill in node features per graph using in-place operations
+        node_idx = 0
+        for b in range(batch_size):
+            num_nodes = (batch.batch == b).sum().item()
+            # Use narrow + copy_ for more efficient in-place operation
+            padded_feats[b].narrow(0, 0, num_nodes).copy_(
+                node_feats[node_idx:node_idx + num_nodes]
+            )
+            padding_mask[b].narrow(0, 0, num_nodes).fill_(False)  # False = not padded
+            node_idx += num_nodes
+
+        return padded_feats, padding_mask
 
 
 def _masked_mean(x: torch.Tensor, padding_mask: Optional[torch.Tensor]) -> torch.Tensor:
@@ -369,24 +500,38 @@ def _apply_lora(
     if not target_modules:
         return module
     try:
-        from peft import LoraConfig, TaskType, get_peft_model
+        from peft import inject_adapter_in_model, LoraConfig
     except ImportError as exc:
         raise ImportError("Missing dependency: peft.") from exc
+
     config = LoraConfig(
         r=r,
         lora_alpha=alpha,
         lora_dropout=dropout,
         bias=bias,
         target_modules=target_modules,
-        task_type=TaskType.FEATURE_EXTRACTION,
     )
-    return get_peft_model(module, config)
+
+    inject_adapter_in_model(config, module)
+
+    for name, submodule in module.named_modules():
+        if hasattr(submodule, 'enable_adapters'):
+            submodule.enable_adapters(True)
+        if hasattr(submodule, 'set_adapter'):
+            submodule.set_adapter('default')
+
+    for name, param in module.named_parameters():
+        if 'lora_' in name:
+            param.requires_grad = True
+
+    return module
 
 
 def _apply_sdpa_to_esm(model) -> None:
     if not hasattr(torch.nn.functional, "scaled_dot_product_attention"):
         print("sdpa_unavailable=no_scaled_dot_product_attention", flush=True)
         return
+
     try:
         from esm import multihead_attention as esm_mha
     except ImportError as exc:
@@ -396,6 +541,23 @@ def _apply_sdpa_to_esm(model) -> None:
         return
 
     orig_forward = esm_mha.MultiheadAttention.forward
+
+    def _should_use_sdpa(self, query, key, value, key_padding_mask, incremental_state,
+                         need_weights, static_kv, attn_mask, before_softmax):
+        """Check if we can use SDPA for this forward pass."""
+        return (
+            query.device.type == "cuda"
+            and self.self_attention
+            and attn_mask is None
+            and not before_softmax
+            and incremental_state is None
+            and not static_kv
+            and not need_weights
+            and not self.add_zero_attn
+            and not self.onnx_trace
+            and self.bias_k is None  # Simplify: skip bias_k/bias_v cases
+            # Removed: and not self.rot_emb  # Now supports rotary embeddings!
+        )
 
     def sdpa_forward(
         self,
@@ -412,99 +574,65 @@ def _apply_sdpa_to_esm(model) -> None:
     ):
         if need_head_weights:
             need_weights = True
-        if (
-            query.device.type != "cuda"
-            or attn_mask is not None
-            or before_softmax
-            or incremental_state is not None
-            or static_kv
-            or need_weights
-            or self.add_zero_attn
-            or self.onnx_trace
-        ):
-            return orig_forward(
-                self,
-                query,
-                key,
-                value,
-                key_padding_mask=key_padding_mask,
-                incremental_state=incremental_state,
-                need_weights=need_weights,
-                static_kv=static_kv,
-                attn_mask=attn_mask,
-                before_softmax=before_softmax,
-                need_head_weights=need_head_weights,
-            )
 
-        if not self.self_attention:
-            return orig_forward(
-                self,
-                query,
-                key,
-                value,
-                key_padding_mask=key_padding_mask,
-                incremental_state=incremental_state,
-                need_weights=need_weights,
-                static_kv=static_kv,
-                attn_mask=attn_mask,
-                before_softmax=before_softmax,
-                need_head_weights=need_head_weights,
-            )
+        # Fast path: use SDPA for simple self-attention cases
+        if _should_use_sdpa(self, query, key, value, key_padding_mask, incremental_state,
+                           need_weights, static_kv, attn_mask, before_softmax):
+            tgt_len, bsz, embed_dim = query.size()
 
-        tgt_len, bsz, embed_dim = query.size()
-        q = self.q_proj(query) * self.scaling
-        k = self.k_proj(query)
-        v = self.v_proj(query)
+            # Project Q, K, V
+            q = self.q_proj(query) * self.scaling
+            k = self.k_proj(query)
+            v = self.v_proj(query)
 
-        if self.bias_k is not None:
-            bias_k = self.bias_k.repeat(1, bsz, 1)
-            bias_v = self.bias_v.repeat(1, bsz, 1)
-            k = torch.cat([k, bias_k], dim=0)
-            v = torch.cat([v, bias_v], dim=0)
+            # Reshape to [batch*heads, seq_len, head_dim] for rotary embeddings
+            q = q.view(tgt_len, bsz * self.num_heads, self.head_dim).transpose(0, 1)
+            k = k.view(tgt_len, bsz * self.num_heads, self.head_dim).transpose(0, 1)
+            v = v.view(tgt_len, bsz * self.num_heads, self.head_dim).transpose(0, 1)
+
+            # Apply rotary embeddings if present (ESM2 uses this)
+            if self.rot_emb:
+                q, k = self.rot_emb(q, k)
+
+            # Reshape to [batch, num_heads, seq_len, head_dim] for SDPA
+            q = q.view(bsz, self.num_heads, tgt_len, self.head_dim)
+            k = k.view(bsz, self.num_heads, tgt_len, self.head_dim)
+            v = v.view(bsz, self.num_heads, tgt_len, self.head_dim)
+
+            # Convert padding mask to attention mask format for SDPA
+            attn_mask_sdpa = None
             if key_padding_mask is not None:
-                pad_col = torch.zeros(
-                    (bsz, 1),
-                    dtype=key_padding_mask.dtype,
-                    device=key_padding_mask.device,
-                )
-                key_padding_mask = torch.cat([key_padding_mask, pad_col], dim=1)
+                attn_mask_sdpa = key_padding_mask.unsqueeze(1).unsqueeze(2)
 
-        src_len = k.size(0)
-        q = q.view(tgt_len, bsz, self.num_heads, self.head_dim).transpose(0, 1)
-        k = k.view(src_len, bsz, self.num_heads, self.head_dim).transpose(0, 1)
-        v = v.view(src_len, bsz, self.num_heads, self.head_dim).transpose(0, 1)
+            # Use SDPA with FlashAttention backend
+            attn = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask_sdpa,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=False,
+            )
 
-        if self.rot_emb:
-            q_ = q.permute(0, 2, 1, 3).reshape(bsz * self.num_heads, tgt_len, self.head_dim)
-            k_ = k.permute(0, 2, 1, 3).reshape(bsz * self.num_heads, src_len, self.head_dim)
-            q_, k_ = self.rot_emb(q_, k_)
-            q = q_.view(bsz, self.num_heads, tgt_len, self.head_dim).permute(0, 2, 1, 3)
-            k = k_.view(bsz, self.num_heads, src_len, self.head_dim).permute(0, 2, 1, 3)
-        else:
-            q = q.permute(0, 2, 1, 3)
-            k = k.permute(0, 2, 1, 3)
+            # Reshape back to [seq_len, batch, embed_dim]
+            attn = attn.permute(2, 0, 1, 3).contiguous().view(tgt_len, bsz, embed_dim)
+            attn = self.out_proj(attn)
+            return attn, None
 
-        v = v.permute(0, 2, 1, 3)
-
-        attn_mask_sdpa = None
-        if key_padding_mask is not None:
-            attn_mask_sdpa = key_padding_mask.to(torch.bool).unsqueeze(1).unsqueeze(2)
-
-        attn = torch.nn.functional.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attn_mask_sdpa,
-            dropout_p=self.dropout if self.training else 0.0,
-            is_causal=False,
+        # Fallback to original implementation for complex cases
+        return orig_forward(
+            self, query, key, value,
+            key_padding_mask=key_padding_mask,
+            incremental_state=incremental_state,
+            need_weights=need_weights,
+            static_kv=static_kv,
+            attn_mask=attn_mask,
+            before_softmax=before_softmax,
+            need_head_weights=need_head_weights,
         )
-        attn = attn.permute(0, 2, 1, 3).contiguous().view(bsz, tgt_len, embed_dim)
-        attn = attn.transpose(0, 1)
-        attn = self.out_proj(attn)
-        return attn, None
 
     esm_mha.MultiheadAttention.forward = sdpa_forward
     esm_mha._sdpa_patched = True
+
+    # Enable flash attention backends if available
     if torch.cuda.is_available():
         try:
             torch.backends.cuda.enable_flash_sdp(True)
@@ -512,7 +640,18 @@ def _apply_sdpa_to_esm(model) -> None:
             torch.backends.cuda.enable_math_sdp(True)
         except Exception:
             pass
-    print("sdpa_patched_for_esm=True", flush=True)
+
+    print("sdpa_patched_for_esm=True (with_rotary_embedding_support)", flush=True)
+
+    # Log available SDPA backends for verification
+    if torch.cuda.is_available():
+        try:
+            flash_enabled = torch.backends.cuda.flash_sdp_enabled()
+            mem_efficient_enabled = torch.backends.cuda.mem_efficient_sdp_enabled()
+            math_enabled = torch.backends.cuda.math_sdp_enabled()
+            print(f"sdpa_backends: flash={flash_enabled}, mem_efficient={mem_efficient_enabled}, math={math_enabled}", flush=True)
+        except Exception:
+            pass
 
 
 def _enable_gradient_checkpointing_esm(model) -> None:
@@ -554,6 +693,42 @@ def _enable_gradient_checkpointing_esm(model) -> None:
             model.layers[idx] = CheckpointedLayer(layer)
     model._gc_wrapped = True
     print("grad_checkpointing=enabled_for_esm", flush=True)
+
+
+def _enable_gradient_checkpointing_cross_attn(model) -> None:
+    """Enable gradient checkpointing for cross-attention module."""
+    if getattr(model, "_cross_attn_gc_wrapped", False):
+        return
+
+    original_forward = model.cross_attn.forward
+
+    def checkpointed_cross_attn(query, key, value, key_padding_mask=None,
+                                need_weights=True, attn_mask=None,
+                                average_attn_weights=True):
+        if not model.training:
+            return original_forward(query, key, value,
+                                   key_padding_mask=key_padding_mask,
+                                   need_weights=need_weights,
+                                   attn_mask=attn_mask,
+                                   average_attn_weights=average_attn_weights)
+
+        # Checkpointed path - force need_weights=False to save memory
+        def forward_fn(q, k, v):
+            out, _ = original_forward(q, k, v,
+                                     key_padding_mask=key_padding_mask,
+                                     need_weights=False,
+                                     attn_mask=attn_mask,
+                                     average_attn_weights=average_attn_weights)
+            return out
+
+        result = torch.utils.checkpoint.checkpoint(
+            forward_fn, query, key, value, use_reentrant=False
+        )
+        return result, None
+
+    model.cross_attn.forward = checkpointed_cross_attn
+    model._cross_attn_gc_wrapped = True
+    print("grad_checkpointing=enabled_for_cross_attention", flush=True)
 
 
 def _init_wandb(args):
@@ -607,12 +782,28 @@ class ProteinCompoundClassifier(nn.Module):
         )
 
     def forward(self, protein_seqs: List[str], smiles_list: List[str], device: torch.device) -> torch.Tensor:
-        prot_tokens, prot_pad = self.protein_encoder(protein_seqs, device)
-        comp_tokens = self.compound_encoder(smiles_list, device)
-        prot_tokens = self.proj_protein(prot_tokens)
-        comp_tokens = self.proj_compound(comp_tokens)
-        fused, _ = self.cross_attn(prot_tokens, comp_tokens, comp_tokens)
+        # Get encoder outputs with masks
+        prot_tokens, prot_pad = self.protein_encoder(protein_seqs, device)  # [B, L_p, 1280]
+        comp_tokens, comp_pad = self.compound_encoder(smiles_list, device)  # [B, L_c, 300]
+
+        # Project to common dimension
+        prot_tokens = self.proj_protein(prot_tokens)  # [B, L_p, 512]
+        comp_tokens = self.proj_compound(comp_tokens)  # [B, L_c, 512]
+
+        # Cross-attention: protein (Q) attends to compound atoms (K, V)
+        # Force need_weights=False to save memory (we don't use attention weights)
+        fused, _ = self.cross_attn(
+            prot_tokens,              # query
+            comp_tokens,              # key
+            comp_tokens,              # value
+            key_padding_mask=comp_pad, # mask padded compound atoms
+            need_weights=False        # Don't compute/store attention weights
+        )
+
+        # Pool fused protein tokens (respecting protein padding)
         pooled = _masked_mean(fused, prot_pad)
+
+        # Classify
         logits = self.classifier(pooled).squeeze(-1)
         return logits
 
@@ -661,6 +852,8 @@ def configure_tuning(
 ) -> None:
     if tuning_mode == "full":
         _set_requires_grad(model, True)
+        model.protein_encoder.freeze = False
+        model.compound_encoder.freeze = False
         return
 
     _set_requires_grad(model, False)
@@ -670,6 +863,8 @@ def configure_tuning(
     _set_requires_grad(model.classifier, True)
 
     if tuning_mode == "lora":
+        model.protein_encoder.freeze = False
+        model.compound_encoder.freeze = False
         model.protein_encoder.model = _apply_lora(
             model.protein_encoder.model,
             lora_targets_protein,
@@ -787,6 +982,12 @@ def main() -> None:
         default=1,
         help="Number of batches to accumulate gradients before optimizer step.",
     )
+    parser.add_argument(
+        "--max-rna-length",
+        type=int,
+        default=4096,
+        help="Maximum RNA sequence length. Samples with longer sequences will be discarded.",
+    )
     args = parser.parse_args()
     if args.gradient_accumulation_steps < 1:
         raise ValueError("gradient_accumulation_steps must be >= 1")
@@ -809,6 +1010,8 @@ def main() -> None:
         _apply_sdpa_to_esm(model.protein_encoder.model)
     if args.grad_checkpoint:
         _enable_gradient_checkpointing_esm(model.protein_encoder.model)
+        model.compound_encoder.enable_gradient_checkpointing()
+        _enable_gradient_checkpointing_cross_attn(model)
     configure_tuning(
         model,
         tuning_mode=args.tuning_mode,
@@ -857,6 +1060,27 @@ def main() -> None:
     df = df[(df["rna_sequence"] != "") & (df["smiles_sequence"] != "")]
     print(f"filtered_rows={len(df)}")
     print(f"dataset/filtered_rows={len(df)}")
+
+    # Filter by RNA sequence length
+    rna_lengths = df["rna_sequence"].astype(str).str.len()
+    too_long = (rna_lengths > args.max_rna_length).sum()
+    print(f"max_rna_length={args.max_rna_length}")
+    if too_long > 0:
+        print(f"Discarding {int(too_long)} samples with RNA length > {args.max_rna_length}")
+        df = df[rna_lengths <= args.max_rna_length]
+        print(f"dataset/discarded_long_rna={int(too_long)}")
+        print(f"dataset/after_length_filter={len(df)}")
+    else:
+        print(f"All samples within max_rna_length={args.max_rna_length}")
+
+    # Log to WandB if enabled
+    if wandb_run is not None:
+        wandb_run.config.update({
+            "max_rna_length": args.max_rna_length,
+            "discarded_long_rna": int(too_long),
+            "samples_after_length_filter": len(df),
+        })
+
     label_counts = df["label"].value_counts().to_dict()
     for key, value in label_counts.items():
         print(f"dataset/label_{key}={int(value)}")
@@ -912,7 +1136,7 @@ def main() -> None:
     for epoch in range(1, args.epochs + 1):
         train_loss = train_epoch(
             model, train_loader, optimizer, device, args.amp, scaler,
-            accumulation_steps=args.gradient_accumulation_steps)
+            accumulation_steps=args.gradient_accumulation_steps, wandb_run=wandb_run)
         test_loss, test_metrics = evaluate(
             model, test_loader, device, args.amp)
         metric_parts = [f"{k}={v:.4f}" for k, v in test_metrics.items()]
@@ -926,6 +1150,13 @@ def main() -> None:
                 "train/loss": train_loss,
                 "test/loss": test_loss,
             }
+
+            # Add memory metrics
+            if device.type == "cuda":
+                log_data["memory/allocated_gb"] = torch.cuda.memory_allocated(device) / 1024**3
+                log_data["memory/reserved_gb"] = torch.cuda.memory_reserved(device) / 1024**3
+                log_data["memory/peak_gb"] = torch.cuda.max_memory_allocated(device) / 1024**3
+
             for key, value in test_metrics.items():
                 log_data[f"test/{key}"] = value
             wandb_run.log(log_data, step=epoch)
