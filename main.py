@@ -102,8 +102,9 @@ def _collate_batch(batch):
 
 
 def _binary_metrics(preds: torch.Tensor, labels: torch.Tensor) -> dict:
-    preds = preds.detach().cpu()
-    labels = labels.detach().cpu()
+    # Convert to float32 to avoid BFloat16 issues with sklearn
+    preds = preds.detach().cpu().float()
+    labels = labels.detach().cpu().float()
     pred_labels = (preds >= 0.5).to(torch.int64)
     labels_int = labels.to(torch.int64)
     tp = int(((pred_labels == 1) & (labels_int == 1)).sum())
@@ -194,6 +195,7 @@ def train_epoch(
     accumulation_steps: int = 1,
     debug: bool = False,
     wandb_run: Optional[wandb.Run] = None,
+    grad_clip: Optional[float] = None,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -252,24 +254,50 @@ def train_epoch(
         is_last_batch = (batch_idx + 1) == len(loader)
         should_update = ((batch_idx + 1) % accumulation_steps == 0) or is_last_batch
         if should_update:
-            # Compute gradient norm before optimizer step
+            # Unscale gradients first if using GradScaler
             if scaler is not None:
                 scaler.unscale_(optimizer)
 
-            total_norm = 0.0
-            for p in model.parameters():
-                if p.grad is not None:
-                    param_norm = p.grad.data.norm(2)
-                    total_norm += param_norm.item() ** 2
-            grad_norm = total_norm ** 0.5
+            # Apply gradient clipping if specified and compute norms
+            if grad_clip is not None:
+                # clip_grad_norm_ returns the total norm before clipping
+                grad_norm_unclipped = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), grad_clip
+                ).item()
 
-            # Log gradient norm to wandb
+                # Compute the actual norm after clipping
+                total_norm = 0.0
+                for p in model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        total_norm += param_norm.item() ** 2
+                grad_norm_clipped = total_norm ** 0.5
+            else:
+                # Just compute the gradient norm without clipping
+                total_norm = 0.0
+                for p in model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        total_norm += param_norm.item() ** 2
+                grad_norm_unclipped = total_norm ** 0.5
+                grad_norm_clipped = grad_norm_unclipped
+
+            # Log gradient norms to wandb
             if wandb_run is not None:
-                wandb_run.log({"train/grad_norm": grad_norm})
+                log_data = {
+                    "train/grad_norm_unclipped": grad_norm_unclipped,
+                }
+                if grad_clip is not None:
+                    log_data["train/grad_norm_clipped"] = grad_norm_clipped
+                    log_data["train/grad_clipped"] = 1.0 if grad_norm_unclipped > grad_clip else 0.0
+                wandb_run.log(log_data)
 
             # Print gradient norm periodically
             if batch_idx % 10 == 0:
-                print(f"batch={batch_idx} grad_norm={grad_norm:.4f}", flush=True)
+                if grad_clip is not None:
+                    print(f"batch={batch_idx} grad_norm={grad_norm_unclipped:.4f} (clipped={grad_norm_clipped:.4f})", flush=True)
+                else:
+                    print(f"batch={batch_idx} grad_norm={grad_norm_unclipped:.4f}", flush=True)
 
             # Optimizer step
             if scaler is not None:
@@ -988,6 +1016,12 @@ def main() -> None:
         default=4096,
         help="Maximum RNA sequence length. Samples with longer sequences will be discarded.",
     )
+    parser.add_argument(
+        "--grad-clip",
+        type=float,
+        default=1,
+        help="Gradient clipping threshold (max norm). If None, no clipping is applied.",
+    )
     args = parser.parse_args()
     if args.gradient_accumulation_steps < 1:
         raise ValueError("gradient_accumulation_steps must be >= 1")
@@ -1133,10 +1167,20 @@ def main() -> None:
         f"model/trainable_pct={100.0 * trainable_params / total_params:.2f}%"
     )
 
+    # Log gradient clipping configuration
+    if args.grad_clip is not None:
+        print(f"gradient_clipping=enabled max_norm={args.grad_clip}", flush=True)
+        if wandb_run is not None:
+            wandb_run.config.update({"grad_clip": args.grad_clip})
+    else:
+        print("gradient_clipping=disabled", flush=True)
+
     for epoch in range(1, args.epochs + 1):
         train_loss = train_epoch(
             model, train_loader, optimizer, device, args.amp, scaler,
-            accumulation_steps=args.gradient_accumulation_steps, wandb_run=wandb_run)
+            accumulation_steps=args.gradient_accumulation_steps,
+            wandb_run=wandb_run,
+            grad_clip=args.grad_clip)
         test_loss, test_metrics = evaluate(
             model, test_loader, device, args.amp)
         metric_parts = [f"{k}={v:.4f}" for k, v in test_metrics.items()]
