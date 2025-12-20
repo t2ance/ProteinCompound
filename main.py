@@ -10,7 +10,6 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, random_split
 from contextlib import nullcontext
 
-
 def _ensure_repo_path(repo_root: str, label: str) -> None:
     if not repo_root:
         raise ValueError(f"{label} is required.")
@@ -377,6 +376,179 @@ def _apply_lora(
     return get_peft_model(module, config)
 
 
+def _apply_sdpa_to_esm(model) -> None:
+    if not hasattr(torch.nn.functional, "scaled_dot_product_attention"):
+        print("sdpa_unavailable=no_scaled_dot_product_attention", flush=True)
+        return
+    try:
+        from esm import multihead_attention as esm_mha
+    except ImportError as exc:
+        raise ImportError("Failed to import ESM for SDPA.") from exc
+
+    if getattr(esm_mha, "_sdpa_patched", False):
+        return
+
+    orig_forward = esm_mha.MultiheadAttention.forward
+
+    def sdpa_forward(
+        self,
+        query,
+        key=None,
+        value=None,
+        key_padding_mask=None,
+        incremental_state=None,
+        need_weights=True,
+        static_kv=False,
+        attn_mask=None,
+        before_softmax=False,
+        need_head_weights=False,
+    ):
+        if need_head_weights:
+            need_weights = True
+        if (
+            query.device.type != "cuda"
+            or attn_mask is not None
+            or before_softmax
+            or incremental_state is not None
+            or static_kv
+            or need_weights
+            or self.add_zero_attn
+            or self.onnx_trace
+        ):
+            return orig_forward(
+                self,
+                query,
+                key,
+                value,
+                key_padding_mask=key_padding_mask,
+                incremental_state=incremental_state,
+                need_weights=need_weights,
+                static_kv=static_kv,
+                attn_mask=attn_mask,
+                before_softmax=before_softmax,
+                need_head_weights=need_head_weights,
+            )
+
+        if not self.self_attention:
+            return orig_forward(
+                self,
+                query,
+                key,
+                value,
+                key_padding_mask=key_padding_mask,
+                incremental_state=incremental_state,
+                need_weights=need_weights,
+                static_kv=static_kv,
+                attn_mask=attn_mask,
+                before_softmax=before_softmax,
+                need_head_weights=need_head_weights,
+            )
+
+        tgt_len, bsz, embed_dim = query.size()
+        q = self.q_proj(query) * self.scaling
+        k = self.k_proj(query)
+        v = self.v_proj(query)
+
+        if self.bias_k is not None:
+            bias_k = self.bias_k.repeat(1, bsz, 1)
+            bias_v = self.bias_v.repeat(1, bsz, 1)
+            k = torch.cat([k, bias_k], dim=0)
+            v = torch.cat([v, bias_v], dim=0)
+            if key_padding_mask is not None:
+                pad_col = torch.zeros(
+                    (bsz, 1),
+                    dtype=key_padding_mask.dtype,
+                    device=key_padding_mask.device,
+                )
+                key_padding_mask = torch.cat([key_padding_mask, pad_col], dim=1)
+
+        src_len = k.size(0)
+        q = q.view(tgt_len, bsz, self.num_heads, self.head_dim).transpose(0, 1)
+        k = k.view(src_len, bsz, self.num_heads, self.head_dim).transpose(0, 1)
+        v = v.view(src_len, bsz, self.num_heads, self.head_dim).transpose(0, 1)
+
+        if self.rot_emb:
+            q_ = q.permute(0, 2, 1, 3).reshape(bsz * self.num_heads, tgt_len, self.head_dim)
+            k_ = k.permute(0, 2, 1, 3).reshape(bsz * self.num_heads, src_len, self.head_dim)
+            q_, k_ = self.rot_emb(q_, k_)
+            q = q_.view(bsz, self.num_heads, tgt_len, self.head_dim).permute(0, 2, 1, 3)
+            k = k_.view(bsz, self.num_heads, src_len, self.head_dim).permute(0, 2, 1, 3)
+        else:
+            q = q.permute(0, 2, 1, 3)
+            k = k.permute(0, 2, 1, 3)
+
+        v = v.permute(0, 2, 1, 3)
+
+        attn_mask_sdpa = None
+        if key_padding_mask is not None:
+            attn_mask_sdpa = key_padding_mask.to(torch.bool).unsqueeze(1).unsqueeze(2)
+
+        attn = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask_sdpa,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=False,
+        )
+        attn = attn.permute(0, 2, 1, 3).contiguous().view(bsz, tgt_len, embed_dim)
+        attn = attn.transpose(0, 1)
+        attn = self.out_proj(attn)
+        return attn, None
+
+    esm_mha.MultiheadAttention.forward = sdpa_forward
+    esm_mha._sdpa_patched = True
+    if torch.cuda.is_available():
+        try:
+            torch.backends.cuda.enable_flash_sdp(True)
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+            torch.backends.cuda.enable_math_sdp(True)
+        except Exception:
+            pass
+    print("sdpa_patched_for_esm=True", flush=True)
+
+
+def _enable_gradient_checkpointing_esm(model) -> None:
+    if getattr(model, "_gc_wrapped", False):
+        return
+    if not hasattr(torch.utils, "checkpoint"):
+        print("grad_checkpoint_unavailable=no_torch_checkpoint", flush=True)
+        return
+
+    class CheckpointedLayer(nn.Module):
+        def __init__(self, layer: nn.Module):
+            super().__init__()
+            self.layer = layer
+
+        def forward(self, x, self_attn_mask=None, self_attn_padding_mask=None, need_head_weights=False):
+            if not self.training or need_head_weights or self_attn_mask is not None:
+                return self.layer(
+                    x,
+                    self_attn_mask=self_attn_mask,
+                    self_attn_padding_mask=self_attn_padding_mask,
+                    need_head_weights=need_head_weights,
+                )
+
+            def layer_forward(x_input):
+                return self.layer(
+                    x_input,
+                    self_attn_mask=self_attn_mask,
+                    self_attn_padding_mask=self_attn_padding_mask,
+                    need_head_weights=False,
+                )
+
+            try:
+                return torch.utils.checkpoint.checkpoint(layer_forward, x, use_reentrant=False)
+            except TypeError:
+                return torch.utils.checkpoint.checkpoint(layer_forward, x)
+
+    for idx, layer in enumerate(model.layers):
+        if not isinstance(layer, CheckpointedLayer):
+            model.layers[idx] = CheckpointedLayer(layer)
+    model._gc_wrapped = True
+    print("grad_checkpointing=enabled_for_esm", flush=True)
+
+
 def _init_wandb(args):
     try:
         import wandb
@@ -592,6 +764,16 @@ def main() -> None:
         default="bf16",
         help="Mixed precision mode (CUDA only).",
     )
+    parser.add_argument(
+        "--flash-attn",
+        action="store_true",
+        help="Enable PyTorch SDPA for ESM (FlashAttention backend when available).",
+    )
+    parser.add_argument(
+        "--grad-checkpoint",
+        action="store_true",
+        help="Enable gradient checkpointing for ESM layers.",
+    )
     args = parser.parse_args()
     wandb_run = None
     wandb_module = None
@@ -608,6 +790,10 @@ def main() -> None:
         mlp_hidden=args.mlp_hidden,
         tuning_mode=args.tuning_mode,
     )
+    if args.flash_attn:
+        _apply_sdpa_to_esm(model.protein_encoder.model)
+    if args.grad_checkpoint:
+        _enable_gradient_checkpointing_esm(model.protein_encoder.model)
     configure_tuning(
         model,
         tuning_mode=args.tuning_mode,
