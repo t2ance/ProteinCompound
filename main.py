@@ -190,24 +190,31 @@ def train_epoch(
     device: torch.device,
     amp_mode: str,
     scaler: Optional[torch.cuda.amp.GradScaler],
+    accumulation_steps: int = 1,
 ) -> float:
     model.train()
     total_loss = 0.0
     loss_fn = nn.BCEWithLogitsLoss()
-    for rna, smiles, labels in loader:
+    optimizer.zero_grad(set_to_none=True)
+    for batch_idx, (rna, smiles, labels) in enumerate(loader):
         labels = labels.to(device)
-        optimizer.zero_grad(set_to_none=True)
         with _amp_context(device, amp_mode):
             logits = model(rna, smiles, device=device)
             loss = loss_fn(logits, labels)
         if scaler is not None:
             scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
         else:
             loss.backward()
-            optimizer.step()
         total_loss += loss.item() * labels.size(0)
+        is_last_batch = (batch_idx + 1) == len(loader)
+        should_update = ((batch_idx + 1) % accumulation_steps == 0) or is_last_batch
+        if should_update:
+            if scaler is not None:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
     return total_loss / max(len(loader.dataset), 1)
 
 
@@ -774,7 +781,15 @@ def main() -> None:
         action="store_true",
         help="Enable gradient checkpointing for ESM layers.",
     )
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=1,
+        help="Number of batches to accumulate gradients before optimizer step.",
+    )
     args = parser.parse_args()
+    if args.gradient_accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be >= 1")
     wandb_run = None
     wandb_module = None
     if args.wandb:
@@ -896,7 +911,8 @@ def main() -> None:
 
     for epoch in range(1, args.epochs + 1):
         train_loss = train_epoch(
-            model, train_loader, optimizer, device, args.amp, scaler)
+            model, train_loader, optimizer, device, args.amp, scaler,
+            accumulation_steps=args.gradient_accumulation_steps)
         test_loss, test_metrics = evaluate(
             model, test_loader, device, args.amp)
         metric_parts = [f"{k}={v:.4f}" for k, v in test_metrics.items()]
