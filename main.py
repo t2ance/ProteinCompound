@@ -1127,6 +1127,11 @@ def main() -> None:
             f"sampling {args.max_samples} rows from {len(df)} total rows, seed={args.seed}")
         df = df.sample(n=min(args.max_samples, len(df)),
                        random_state=args.seed)
+
+    # Shuffle the dataset before train/test split
+    print(f"shuffling dataset, seed={args.seed}")
+    df = df.sample(frac=1, random_state=args.seed).reset_index(drop=True)
+
     dataset = PairDataset(df)
     if len(dataset) < 2:
         raise RuntimeError("Dataset too small after filtering.")
@@ -1183,6 +1188,7 @@ def main() -> None:
             grad_clip=args.grad_clip)
         test_loss, test_metrics = evaluate(
             model, test_loader, device, args.amp)
+        print('test metrics:', test_metrics)
         metric_parts = [f"{k}={v:.4f}" for k, v in test_metrics.items()]
         print(
             f"epoch={epoch} train_loss={train_loss:.4f} "
@@ -1195,6 +1201,10 @@ def main() -> None:
                 "test/loss": test_loss,
             }
 
+            # # add test_metrics to log_data
+            # for key, value in test_metrics.items():
+            #     log_data[f"test/{key}"] = value
+
             # Add memory metrics
             if device.type == "cuda":
                 log_data["memory/allocated_gb"] = torch.cuda.memory_allocated(device) / 1024**3
@@ -1202,8 +1212,9 @@ def main() -> None:
                 log_data["memory/peak_gb"] = torch.cuda.max_memory_allocated(device) / 1024**3
 
             for key, value in test_metrics.items():
+                print('adding test metric:', key, value)
                 log_data[f"test/{key}"] = value
-            wandb_run.log(log_data, step=epoch)
+            wandb_run.log(log_data)
         if args.eval_train:
             train_eval_loss, train_metrics = evaluate(
                 model, train_loader, device, args.amp)
@@ -1220,7 +1231,7 @@ def main() -> None:
                 }
                 for key, value in train_metrics.items():
                     log_data[f"train_eval/{key}"] = value
-                wandb_run.log(log_data, step=epoch)
+                wandb_run.log(log_data)
 
     if wandb_run is not None:
         wandb_run.finish()
