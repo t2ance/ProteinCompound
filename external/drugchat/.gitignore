@@ -1,0 +1,9 @@
+output
+outputs
+__pycache__
+*.DS_Store
+data
+ckpt
+*results
+results*
+data_public
