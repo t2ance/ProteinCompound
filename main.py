@@ -196,6 +196,7 @@ def train_epoch(
     debug: bool = False,
     wandb_run: Optional[wandb.Run] = None,
     grad_clip: Optional[float] = None,
+    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -204,12 +205,17 @@ def train_epoch(
     for batch_idx, (rna, smiles, labels) in tqdm(enumerate(loader), total=len(loader), desc="Training"):
         labels = labels.to(device)
         with _amp_context(device, amp_mode):
-            logits = model(rna, smiles, device=device)
+            # Disable debug for normal training
+            logits = model(rna, smiles, device=device, debug=False)
             loss = loss_fn(logits, labels)
+
+        # Scale loss for gradient accumulation (average instead of sum)
+        scaled_loss = loss / accumulation_steps
+
         if scaler is not None:
-            scaler.scale(loss).backward()
+            scaler.scale(scaled_loss).backward()
         else:
-            loss.backward()
+            scaled_loss.backward()
         total_loss += loss.item() * labels.size(0)
 
         # Log batch loss to wandb
@@ -235,21 +241,33 @@ def train_epoch(
             mem_peak = torch.cuda.max_memory_allocated(device) / 1024**3
             print(f"mem_peak_so_far={mem_peak:.2f}GB", flush=True)
 
+        # Optional debug logging for first batch (disabled by default)
         if debug and batch_idx == 0:
-            print(f"\n=== Debug Info Batch {batch_idx} ===")
-            print(f"Loss: {loss.item():.4f}")
-            lora_grads = []
+            print(f"\n{'='*80}")
+            print(f"=== DEBUG BATCH {batch_idx} ===")
+            print(f"{'='*80}")
+            print(f"\n[LOSS] Loss: {loss.item():.6f}")
+            print(f"[LABELS] Shape: {labels.shape}, Min: {labels.min().item():.4f}, Max: {labels.max().item():.4f}, Mean: {labels.mean().item():.4f}")
+            print(f"[LOGITS] Shape: {logits.shape}, Min: {logits.min().item():.4f}, Max: {logits.max().item():.4f}, Mean: {logits.mean().item():.4f}, Std: {logits.std().item():.4f}")
+
+            # Check gradient flow
+            print(f"\n[GRADIENT FLOW CHECK]")
+            grad_stats = {}
             for name, param in model.named_parameters():
                 if param.requires_grad and param.grad is not None:
                     grad_norm = param.grad.norm().item()
-                    if 'lora' in name.lower():
-                        lora_grads.append((name, grad_norm))
-                    if grad_norm > 0:
-                        print(f"{name}: grad_norm={grad_norm:.6f}")
-            if lora_grads:
-                print(f"\n=== LoRA gradients found: {len(lora_grads)} ===")
-            else:
-                print(f"\n=== WARNING: No LoRA gradients! ===")
+                    module_prefix = name.split('.')[0]
+                    if module_prefix not in grad_stats:
+                        grad_stats[module_prefix] = []
+                    grad_stats[module_prefix].append(grad_norm)
+
+            for module, norms in grad_stats.items():
+                avg_norm = sum(norms) / len(norms)
+                max_norm = max(norms)
+                print(f"  {module}: avg_grad_norm={avg_norm:.6f}, max_grad_norm={max_norm:.6f}, num_params={len(norms)}")
+
+            if not grad_stats:
+                print("  WARNING: No gradients found!")
 
         is_last_batch = (batch_idx + 1) == len(loader)
         should_update = ((batch_idx + 1) % accumulation_steps == 0) or is_last_batch
@@ -305,6 +323,15 @@ def train_epoch(
                 scaler.update()
             else:
                 optimizer.step()
+
+            # Step the scheduler after each optimizer update
+            if scheduler is not None:
+                scheduler.step()
+
+            # Log learning rate (enabled by default when scheduler is active)
+            if wandb_run is not None and scheduler is not None:
+                wandb_run.log({"train/learning_rate": optimizer.param_groups[0]['lr']})
+
             optimizer.zero_grad(set_to_none=True)
 
             # Clear CUDA cache after optimizer step to prevent fragmentation
@@ -728,6 +755,10 @@ def _enable_gradient_checkpointing_cross_attn(model) -> None:
     if getattr(model, "_cross_attn_gc_wrapped", False):
         return
 
+    # Skip if using concat fusion mode (no cross_attn)
+    if model.cross_attn is None:
+        return
+
     original_forward = model.cross_attn.forward
 
     def checkpointed_cross_attn(query, key, value, key_padding_mask=None,
@@ -792,47 +823,106 @@ class ProteinCompoundClassifier(nn.Module):
         num_heads: int = 8,
         mlp_hidden: int = 256,
         dropout: float = 0.1,
+        fusion_mode: str = "xattn",
     ):
         super().__init__()
         self.protein_encoder = protein_encoder
         self.compound_encoder = compound_encoder
+        self.fusion_mode = fusion_mode
+
         self.proj_protein = nn.Linear(
             protein_encoder.embedding_dim, hidden_dim)
         self.proj_compound = nn.Linear(
             compound_encoder.embedding_dim, hidden_dim)
-        self.cross_attn = nn.MultiheadAttention(
-            hidden_dim, num_heads, batch_first=True)
+
+        # Cross-attention only for xattn mode
+        if fusion_mode == "xattn":
+            self.cross_attn = nn.MultiheadAttention(
+                hidden_dim, num_heads, batch_first=True)
+            classifier_input_dim = hidden_dim
+        elif fusion_mode == "concat":
+            self.cross_attn = None
+            classifier_input_dim = hidden_dim * 2  # concat protein + compound
+        else:
+            raise ValueError(f"Unknown fusion_mode: {fusion_mode}")
+
         self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim, mlp_hidden),
+            nn.Linear(classifier_input_dim, mlp_hidden),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(mlp_hidden, 1),
         )
 
-    def forward(self, protein_seqs: List[str], smiles_list: List[str], device: torch.device) -> torch.Tensor:
+    def forward(self, protein_seqs: List[str], smiles_list: List[str], device: torch.device, debug: bool = False) -> torch.Tensor:
         # Get encoder outputs with masks
         prot_tokens, prot_pad = self.protein_encoder(protein_seqs, device)  # [B, L_p, 1280]
         comp_tokens, comp_pad = self.compound_encoder(smiles_list, device)  # [B, L_c, 300]
+
+        if debug:
+            print(f"\n[ENCODER OUTPUTS]")
+            print(f"  prot_tokens: {prot_tokens.shape}, mean={prot_tokens.mean().item():.4f}, std={prot_tokens.std().item():.4f}")
+            print(f"  prot_pad: {prot_pad.shape}, True%={prot_pad.float().mean().item():.2%} (True=padding)")
+            print(f"  comp_tokens: {comp_tokens.shape}, mean={comp_tokens.mean().item():.4f}, std={comp_tokens.std().item():.4f}")
+            print(f"  comp_pad: {comp_pad.shape}, True%={comp_pad.float().mean().item():.2%} (True=padding)")
 
         # Project to common dimension
         prot_tokens = self.proj_protein(prot_tokens)  # [B, L_p, 512]
         comp_tokens = self.proj_compound(comp_tokens)  # [B, L_c, 512]
 
-        # Cross-attention: protein (Q) attends to compound atoms (K, V)
-        # Force need_weights=False to save memory (we don't use attention weights)
-        fused, _ = self.cross_attn(
-            prot_tokens,              # query
-            comp_tokens,              # key
-            comp_tokens,              # value
-            key_padding_mask=comp_pad, # mask padded compound atoms
-            need_weights=False        # Don't compute/store attention weights
-        )
+        if debug:
+            print(f"\n[AFTER PROJECTION]")
+            print(f"  prot_tokens: {prot_tokens.shape}, mean={prot_tokens.mean().item():.4f}, std={prot_tokens.std().item():.4f}")
+            print(f"  comp_tokens: {comp_tokens.shape}, mean={comp_tokens.mean().item():.4f}, std={comp_tokens.std().item():.4f}")
 
-        # Pool fused protein tokens (respecting protein padding)
-        pooled = _masked_mean(fused, prot_pad)
+        # Fusion: either cross-attention or concat
+        if self.fusion_mode == "xattn":
+            # Cross-attention: protein (Q) attends to compound atoms (K, V)
+            fused, attn_weights = self.cross_attn(
+                prot_tokens,              # query
+                comp_tokens,              # key
+                comp_tokens,              # value
+                key_padding_mask=comp_pad, # mask padded compound atoms
+                need_weights=False,        # Disable for memory efficiency
+                average_attn_weights=True
+            )
+
+            if debug:
+                print(f"\n[AFTER CROSS-ATTENTION]")
+                print(f"  fused: {fused.shape}, mean={fused.mean().item():.4f}, std={fused.std().item():.4f}")
+                if attn_weights is not None:
+                    print(f"  attn_weights: {attn_weights.shape}, mean={attn_weights.mean().item():.4f}, std={attn_weights.std().item():.4f}")
+                    print(f"  attn_weights per query: min={attn_weights.min(dim=-1)[0].mean().item():.4f}, max={attn_weights.max(dim=-1)[0].mean().item():.4f}")
+                    # Check if attention is uniform or peaked
+                    entropy = -(attn_weights * (attn_weights + 1e-10).log()).sum(dim=-1).mean()
+                    max_entropy = torch.log(torch.tensor(attn_weights.size(-1), dtype=torch.float32))
+                    print(f"  attention entropy: {entropy.item():.4f} / {max_entropy.item():.4f} (higher=more uniform)")
+
+            # Pool fused protein tokens (respecting protein padding)
+            pooled = _masked_mean(fused, prot_pad)
+
+        elif self.fusion_mode == "concat":
+            # Simple concatenation: pool both then concat
+            pooled_prot = _masked_mean(prot_tokens, prot_pad)  # [B, 512]
+            pooled_comp = _masked_mean(comp_tokens, comp_pad)  # [B, 512]
+            pooled = torch.cat([pooled_prot, pooled_comp], dim=-1)  # [B, 1024]
+
+            if debug:
+                print(f"\n[AFTER CONCAT FUSION]")
+                print(f"  pooled_prot: {pooled_prot.shape}, mean={pooled_prot.mean().item():.4f}, std={pooled_prot.std().item():.4f}")
+                print(f"  pooled_comp: {pooled_comp.shape}, mean={pooled_comp.mean().item():.4f}, std={pooled_comp.std().item():.4f}")
+                print(f"  pooled: {pooled.shape}, mean={pooled.mean().item():.4f}, std={pooled.std().item():.4f}")
+
+        if debug:
+            print(f"\n[AFTER POOLING]")
+            print(f"  pooled: {pooled.shape}, mean={pooled.mean().item():.4f}, std={pooled.std().item():.4f}")
 
         # Classify
         logits = self.classifier(pooled).squeeze(-1)
+
+        if debug:
+            print(f"\n[CLASSIFIER OUTPUT]")
+            print(f"  logits: {logits.shape}, mean={logits.mean().item():.4f}, std={logits.std().item():.4f}")
+
         return logits
 
 
@@ -846,6 +936,7 @@ def build_model(
     num_heads: int,
     mlp_hidden: int,
     tuning_mode: str,
+    fusion_mode: str = "xattn",
 ) -> ProteinCompoundClassifier:
     freeze_encoders = tuning_mode == "head"
     protein_encoder = ProteinEncoderESM(
@@ -865,6 +956,7 @@ def build_model(
         hidden_dim=hidden_dim,
         num_heads=num_heads,
         mlp_hidden=mlp_hidden,
+        fusion_mode=fusion_mode,
     )
 
 
@@ -887,7 +979,8 @@ def configure_tuning(
     _set_requires_grad(model, False)
     _set_requires_grad(model.proj_protein, True)
     _set_requires_grad(model.proj_compound, True)
-    _set_requires_grad(model.cross_attn, True)
+    if model.cross_attn is not None:
+        _set_requires_grad(model.cross_attn, True)
     _set_requires_grad(model.classifier, True)
 
     if tuning_mode == "lora":
@@ -967,8 +1060,15 @@ def main() -> None:
     )
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument(
+        "--optimizer",
+        choices=["adamw", "sgd"],
+        default="adamw",
+        help="Optimizer type. 'adamw': AdamW optimizer, 'sgd': SGD with momentum.",
+    )
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--momentum", type=float, default=0.9, help="Momentum for SGD optimizer (ignored for AdamW).")
     parser.add_argument("--train-split", type=float, default=0.8)
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--eval-train", action="store_true")
@@ -1022,6 +1122,24 @@ def main() -> None:
         default=1,
         help="Gradient clipping threshold (max norm). If None, no clipping is applied.",
     )
+    parser.add_argument(
+        "--warmup-ratio",
+        type=float,
+        default=0.06,
+        help="Ratio of total steps for linear warmup (default: 0.06 = 6%%).",
+    )
+    parser.add_argument(
+        "--scheduler-type",
+        choices=["none", "linear_warmup_cosine", "cosine"],
+        default="linear_warmup_cosine",
+        help="Learning rate scheduler type. 'none': no scheduler, 'linear_warmup_cosine': warmup + decay, 'cosine': cosine annealing only.",
+    )
+    parser.add_argument(
+        "--fusion-mode",
+        choices=["concat", "xattn"],
+        default="concat",
+        help="Fusion mode for combining protein and compound representations. 'concat': simple concatenation + MLP, 'xattn': cross-attention (original).",
+    )
     args = parser.parse_args()
     if args.gradient_accumulation_steps < 1:
         raise ValueError("gradient_accumulation_steps must be >= 1")
@@ -1039,7 +1157,9 @@ def main() -> None:
         num_heads=args.num_heads,
         mlp_hidden=args.mlp_hidden,
         tuning_mode=args.tuning_mode,
+        fusion_mode=args.fusion_mode,
     )
+    print(f"fusion_mode={args.fusion_mode}", flush=True)
     if args.flash_attn:
         _apply_sdpa_to_esm(model.protein_encoder.model)
     if args.grad_checkpoint:
@@ -1154,13 +1274,37 @@ def main() -> None:
         shuffle=False,
         collate_fn=_collate_batch,
     )
+
+    # Calculate total training steps for scheduler
+    num_batches_per_epoch = len(train_loader)
+    steps_per_epoch = (num_batches_per_epoch + args.gradient_accumulation_steps - 1) // args.gradient_accumulation_steps
+    total_training_steps = steps_per_epoch * args.epochs
+    print(f"scheduler/num_batches_per_epoch={num_batches_per_epoch} "
+          f"scheduler/steps_per_epoch={steps_per_epoch} "
+          f"scheduler/total_training_steps={total_training_steps}")
+
     use_fp16 = args.amp == "fp16" and device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler() if use_fp16 else None
-    optimizer = torch.optim.AdamW(
-        (p for p in model.parameters() if p.requires_grad),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
+
+    # Create optimizer
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    if args.optimizer == "adamw":
+        optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
+        print(f"optimizer/type=AdamW lr={args.lr} weight_decay={args.weight_decay}", flush=True)
+    elif args.optimizer == "sgd":
+        optimizer = torch.optim.SGD(
+            trainable_params,
+            lr=args.lr,
+            momentum=args.momentum,
+            weight_decay=args.weight_decay,
+        )
+        print(f"optimizer/type=SGD lr={args.lr} momentum={args.momentum} weight_decay={args.weight_decay}", flush=True)
+    else:
+        raise ValueError(f"Unknown optimizer: {args.optimizer}")
     print(
         f'trainable parameters {sum(p.numel() for p in model.parameters() if p.requires_grad)} '
         f'({sum(p.numel() for p in model.parameters() if p.requires_grad) / sum(p.numel() for p in model.parameters()) * 100:.2f}%)'
@@ -1180,12 +1324,48 @@ def main() -> None:
     else:
         print("gradient_clipping=disabled", flush=True)
 
+    # Create learning rate scheduler
+    scheduler = None
+    if args.scheduler_type == "linear_warmup_cosine":
+        warmup_steps = max(1, int(args.warmup_ratio * total_training_steps))
+        print(f"scheduler/type=linear_warmup_cosine scheduler/warmup_steps={warmup_steps} "
+              f"scheduler/warmup_ratio={args.warmup_ratio:.4f}", flush=True)
+
+        scheduler1 = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=1e-10/args.lr, end_factor=1.0, total_iters=warmup_steps
+        )
+        scheduler2 = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=total_training_steps - warmup_steps, eta_min=0
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[scheduler1, scheduler2], milestones=[warmup_steps]
+        )
+    elif args.scheduler_type == "cosine":
+        print(f"scheduler/type=cosine scheduler/T_max={total_training_steps}", flush=True)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=total_training_steps, eta_min=0
+        )
+    else:
+        print("scheduler/type=none", flush=True)
+
+    if wandb_run is not None:
+        config_update = {
+            "optimizer": args.optimizer,
+            "scheduler_type": args.scheduler_type,
+            "warmup_ratio": args.warmup_ratio,
+            "total_training_steps": total_training_steps,
+        }
+        if args.optimizer == "sgd":
+            config_update["momentum"] = args.momentum
+        wandb_run.config.update(config_update)
+
     for epoch in range(1, args.epochs + 1):
         train_loss = train_epoch(
             model, train_loader, optimizer, device, args.amp, scaler,
             accumulation_steps=args.gradient_accumulation_steps,
             wandb_run=wandb_run,
-            grad_clip=args.grad_clip)
+            grad_clip=args.grad_clip,
+            scheduler=scheduler)
         test_loss, test_metrics = evaluate(
             model, test_loader, device, args.amp)
         print('test metrics:', test_metrics)
