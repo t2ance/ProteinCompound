@@ -4,6 +4,7 @@ import os
 import sys
 from typing import List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -11,6 +12,23 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from contextlib import nullcontext
 import wandb
 from tqdm import tqdm
+
+_MANUAL_FEATURE_MODULE = None
+
+
+def _get_manual_feature_module():
+    global _MANUAL_FEATURE_MODULE
+    if _MANUAL_FEATURE_MODULE is None:
+        try:
+            import main_ml as manual_features
+        except Exception as exc:
+            raise ImportError(
+                "Failed to import manual feature helpers from main_ml.py; "
+                "ensure its dependencies are installed."
+            ) from exc
+        _MANUAL_FEATURE_MODULE = manual_features
+    return _MANUAL_FEATURE_MODULE
+
 def _ensure_repo_path(repo_root: str, label: str) -> None:
     if not repo_root:
         raise ValueError(f"{label} is required.")
@@ -219,7 +237,7 @@ def train_epoch(
         total_loss += loss.item() * labels.size(0)
 
         # Log batch loss to wandb
-        if wandb_run is not None:
+        if wandb_run is not None and batch_idx % 10 == 0:
             wandb_run.log({"train/batch_loss": loss.item()})
 
         # Memory monitoring (log every 10 batches or when debugging)
@@ -419,6 +437,118 @@ class ProteinEncoderESM(nn.Module):
                 valid[i, pos] = False
         padding_mask = ~valid
         return reps, padding_mask
+
+
+class ManualProteinEncoder(nn.Module):
+    def __init__(self, normalize: bool = True):
+        super().__init__()
+        self._manual_module = _get_manual_feature_module()
+        self.embedding_dim = len(self._manual_module.AMINO_ACIDS)
+        self.normalize = normalize
+        self.register_buffer(
+            "feature_mean",
+            torch.zeros(self.embedding_dim, dtype=torch.float32),
+        )
+        self.register_buffer(
+            "feature_std",
+            torch.ones(self.embedding_dim, dtype=torch.float32),
+        )
+        self.freeze = True
+
+    def set_normalization(self, mean: torch.Tensor, std: torch.Tensor) -> None:
+        if mean.numel() != self.embedding_dim or std.numel() != self.embedding_dim:
+            raise ValueError("Manual protein normalization stats have wrong size.")
+        mean = mean.to(self.feature_mean.device, dtype=torch.float32)
+        std = std.to(self.feature_std.device, dtype=torch.float32)
+        self.feature_mean.copy_(mean)
+        self.feature_std.copy_(std)
+
+    def enable_gradient_checkpointing(self):
+        return
+
+    def forward(self, sequences: List[str], device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        features = []
+        invalid_mask = []
+        for sequence in sequences:
+            feats = self._manual_module.extract_protein_features(sequence)
+            if np.isclose(feats.sum(), 0.0):
+                features.append(np.zeros(self.embedding_dim, dtype=np.float32))
+                invalid_mask.append(True)
+            else:
+                features.append(feats)
+                invalid_mask.append(False)
+        feats_np = np.stack(features, axis=0).astype(np.float32)
+        feats_tensor = torch.from_numpy(feats_np).to(
+            device=device, dtype=torch.float32
+        )
+        if self.normalize:
+            mean = self.feature_mean.to(device=device, dtype=feats_tensor.dtype)
+            std = self.feature_std.to(device=device, dtype=feats_tensor.dtype)
+            feats_tensor = (feats_tensor - mean) / std
+            if any(invalid_mask):
+                invalid = torch.tensor(invalid_mask, device=device)
+                feats_tensor[invalid] = 0.0
+        feats_tensor = feats_tensor.unsqueeze(1)
+        padding_mask = torch.zeros(
+            feats_tensor.size(0), 1, dtype=torch.bool, device=device
+        )
+        return feats_tensor, padding_mask
+
+
+class ManualCompoundEncoder(nn.Module):
+    def __init__(self, normalize: bool = True):
+        super().__init__()
+        self._manual_module = _get_manual_feature_module()
+        self.embedding_dim = len(self._manual_module.COMPOUND_DESCRIPTORS)
+        self.normalize = normalize
+        self.register_buffer(
+            "feature_mean",
+            torch.zeros(self.embedding_dim, dtype=torch.float32),
+        )
+        self.register_buffer(
+            "feature_std",
+            torch.ones(self.embedding_dim, dtype=torch.float32),
+        )
+        self.freeze = True
+
+    def set_normalization(self, mean: torch.Tensor, std: torch.Tensor) -> None:
+        if mean.numel() != self.embedding_dim or std.numel() != self.embedding_dim:
+            raise ValueError("Manual compound normalization stats have wrong size.")
+        mean = mean.to(self.feature_mean.device, dtype=torch.float32)
+        std = std.to(self.feature_std.device, dtype=torch.float32)
+        self.feature_mean.copy_(mean)
+        self.feature_std.copy_(std)
+
+    def enable_gradient_checkpointing(self):
+        return
+
+    def forward(self, smiles_list: List[str], device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        features = []
+        invalid_mask = []
+        for smiles in smiles_list:
+            feats = self._manual_module.extract_compound_features(smiles)
+            if feats is None:
+                features.append(np.zeros(self.embedding_dim, dtype=np.float32))
+                invalid_mask.append(True)
+            else:
+                features.append(feats)
+                invalid_mask.append(False)
+        feats_np = np.stack(features, axis=0).astype(np.float32)
+        feats_tensor = torch.from_numpy(feats_np).to(
+            device=device, dtype=torch.float32
+        )
+        if self.normalize:
+            mean = self.feature_mean.to(device=device, dtype=feats_tensor.dtype)
+            std = self.feature_std.to(device=device, dtype=feats_tensor.dtype)
+            feats_tensor = (feats_tensor - mean) / std
+            if any(invalid_mask):
+                invalid = torch.tensor(invalid_mask, device=device)
+                feats_tensor[invalid] = 0.0
+        feats_tensor = feats_tensor.unsqueeze(1)
+        padding_mask = torch.zeros(
+            feats_tensor.size(0), 1, dtype=torch.bool, device=device
+        )
+        return feats_tensor, padding_mask
 
 
 class DrugChatCompoundEncoder(nn.Module):
@@ -814,11 +944,63 @@ def _amp_context(device: torch.device, amp_mode: str):
     return torch.cuda.amp.autocast(dtype=dtype)
 
 
+def _compute_manual_compound_feature_stats(dataset: Dataset) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
+    manual_module = _get_manual_feature_module()
+    features = []
+    invalid_count = 0
+    for _, smiles, _ in dataset:
+        feats = manual_module.extract_compound_features(smiles)
+        if feats is None:
+            invalid_count += 1
+            continue
+        features.append(feats)
+    if not features:
+        print(
+            "WARNING: no valid SMILES for manual compound normalization; "
+            "using zeros/ones.",
+            file=sys.stderr,
+        )
+        mean = np.zeros(len(manual_module.COMPOUND_DESCRIPTORS), dtype=np.float32)
+        std = np.ones(len(manual_module.COMPOUND_DESCRIPTORS), dtype=np.float32)
+        return torch.from_numpy(mean), torch.from_numpy(std), invalid_count, 0
+    feats_np = np.stack(features, axis=0).astype(np.float32)
+    mean = feats_np.mean(axis=0)
+    std = feats_np.std(axis=0)
+    std[std == 0] = 1.0
+    return torch.from_numpy(mean), torch.from_numpy(std), invalid_count, len(features)
+
+
+def _compute_manual_protein_feature_stats(dataset: Dataset) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
+    manual_module = _get_manual_feature_module()
+    features = []
+    invalid_count = 0
+    for sequence, _, _ in dataset:
+        feats = manual_module.extract_protein_features(sequence)
+        if np.isclose(feats.sum(), 0.0):
+            invalid_count += 1
+            continue
+        features.append(feats)
+    if not features:
+        print(
+            "WARNING: no valid protein sequences for manual normalization; "
+            "using zeros/ones.",
+            file=sys.stderr,
+        )
+        mean = np.zeros(len(manual_module.AMINO_ACIDS), dtype=np.float32)
+        std = np.ones(len(manual_module.AMINO_ACIDS), dtype=np.float32)
+        return torch.from_numpy(mean), torch.from_numpy(std), invalid_count, 0
+    feats_np = np.stack(features, axis=0).astype(np.float32)
+    mean = feats_np.mean(axis=0)
+    std = feats_np.std(axis=0)
+    std[std == 0] = 1.0
+    return torch.from_numpy(mean), torch.from_numpy(std), invalid_count, len(features)
+
+
 class ProteinCompoundClassifier(nn.Module):
     def __init__(
         self,
-        protein_encoder: ProteinEncoderESM,
-        compound_encoder: DrugChatCompoundEncoder,
+        protein_encoder: nn.Module,
+        compound_encoder: nn.Module,
         hidden_dim: int = 512,
         num_heads: int = 8,
         mlp_hidden: int = 256,
@@ -855,8 +1037,8 @@ class ProteinCompoundClassifier(nn.Module):
 
     def forward(self, protein_seqs: List[str], smiles_list: List[str], device: torch.device, debug: bool = False) -> torch.Tensor:
         # Get encoder outputs with masks
-        prot_tokens, prot_pad = self.protein_encoder(protein_seqs, device)  # [B, L_p, 1280]
-        comp_tokens, comp_pad = self.compound_encoder(smiles_list, device)  # [B, L_c, 300]
+        prot_tokens, prot_pad = self.protein_encoder(protein_seqs, device)  # [B, L_p, D_p]
+        comp_tokens, comp_pad = self.compound_encoder(smiles_list, device)  # [B, L_c, D_c]
 
         if debug:
             print(f"\n[ENCODER OUTPUTS]")
@@ -937,19 +1119,27 @@ def build_model(
     mlp_hidden: int,
     tuning_mode: str,
     fusion_mode: str = "xattn",
+    manual_compound_features: bool = False,
+    manual_protein_features: bool = False,
 ) -> ProteinCompoundClassifier:
     freeze_encoders = tuning_mode == "head"
-    protein_encoder = ProteinEncoderESM(
-        esm_root=esm_root,
-        model_name=esm_model,
-        checkpoint_path=esm_checkpoint,
-        freeze=freeze_encoders,
-    )
-    compound_encoder = DrugChatCompoundEncoder(
-        drugchat_root=drugchat_root,
-        gnn_checkpoint=gnn_checkpoint,
-        freeze=freeze_encoders,
-    )
+    if manual_protein_features:
+        protein_encoder = ManualProteinEncoder(normalize=True)
+    else:
+        protein_encoder = ProteinEncoderESM(
+            esm_root=esm_root,
+            model_name=esm_model,
+            checkpoint_path=esm_checkpoint,
+            freeze=freeze_encoders,
+        )
+    if manual_compound_features:
+        compound_encoder = ManualCompoundEncoder(normalize=True)
+    else:
+        compound_encoder = DrugChatCompoundEncoder(
+            drugchat_root=drugchat_root,
+            gnn_checkpoint=gnn_checkpoint,
+            freeze=freeze_encoders,
+        )
     return ProteinCompoundClassifier(
         protein_encoder=protein_encoder,
         compound_encoder=compound_encoder,
@@ -972,8 +1162,10 @@ def configure_tuning(
 ) -> None:
     if tuning_mode == "full":
         _set_requires_grad(model, True)
-        model.protein_encoder.freeze = False
-        model.compound_encoder.freeze = False
+        if hasattr(model.protein_encoder, "freeze"):
+            model.protein_encoder.freeze = False
+        if hasattr(model.compound_encoder, "freeze"):
+            model.compound_encoder.freeze = False
         return
 
     _set_requires_grad(model, False)
@@ -984,24 +1176,28 @@ def configure_tuning(
     _set_requires_grad(model.classifier, True)
 
     if tuning_mode == "lora":
-        model.protein_encoder.freeze = False
-        model.compound_encoder.freeze = False
-        model.protein_encoder.model = _apply_lora(
-            model.protein_encoder.model,
-            lora_targets_protein,
-            lora_r,
-            lora_alpha,
-            lora_dropout,
-            lora_bias,
-        )
-        model.compound_encoder.gnn = _apply_lora(
-            model.compound_encoder.gnn,
-            lora_targets_compound,
-            lora_r,
-            lora_alpha,
-            lora_dropout,
-            lora_bias,
-        )
+        if hasattr(model.protein_encoder, "freeze"):
+            model.protein_encoder.freeze = False
+        if hasattr(model.compound_encoder, "freeze"):
+            model.compound_encoder.freeze = False
+        if hasattr(model.protein_encoder, "model"):
+            model.protein_encoder.model = _apply_lora(
+                model.protein_encoder.model,
+                lora_targets_protein,
+                lora_r,
+                lora_alpha,
+                lora_dropout,
+                lora_bias,
+            )
+        if hasattr(model.compound_encoder, "gnn"):
+            model.compound_encoder.gnn = _apply_lora(
+                model.compound_encoder.gnn,
+                lora_targets_compound,
+                lora_r,
+                lora_alpha,
+                lora_dropout,
+                lora_bias,
+            )
 
 
 def main() -> None:
@@ -1017,6 +1213,16 @@ def main() -> None:
             "DRUGCHAT_GNN_CKPT",
             "external/drugchat/ckpt/gin_contextpred.pth",
         ),
+    )
+    parser.add_argument(
+        "--manual-protein-features",
+        action="store_true",
+        help="Use amino-acid composition features instead of ESM for proteins.",
+    )
+    parser.add_argument(
+        "--manual-compound-features",
+        action="store_true",
+        help="Use RDKit descriptor features instead of DrugChat GNN for compounds.",
     )
     parser.add_argument(
         "--esm-root",
@@ -1158,12 +1364,46 @@ def main() -> None:
         mlp_hidden=args.mlp_hidden,
         tuning_mode=args.tuning_mode,
         fusion_mode=args.fusion_mode,
+        manual_compound_features=args.manual_compound_features,
+        manual_protein_features=args.manual_protein_features,
     )
+    if args.manual_protein_features:
+        manual_module = _get_manual_feature_module()
+        print(
+            "protein_encoder=manual "
+            f"features={len(manual_module.AMINO_ACIDS)} normalize=standard",
+            flush=True,
+        )
+    else:
+        print(
+            "protein_encoder=esm "
+            f"model={args.esm_model} checkpoint={args.esm_checkpoint}",
+            flush=True,
+        )
+    if args.manual_compound_features:
+        manual_module = _get_manual_feature_module()
+        print(
+            "compound_encoder=manual "
+            f"descriptors={','.join(manual_module.COMPOUND_DESCRIPTORS)} "
+            "normalize=standard",
+            flush=True,
+        )
+    else:
+        print(
+            f"compound_encoder=drugchat gnn_checkpoint={args.gnn_checkpoint}",
+            flush=True,
+        )
     print(f"fusion_mode={args.fusion_mode}", flush=True)
     if args.flash_attn:
-        _apply_sdpa_to_esm(model.protein_encoder.model)
+        if args.manual_protein_features:
+            print("flash_attn=skipped manual_protein_features=True", flush=True)
+        else:
+            _apply_sdpa_to_esm(model.protein_encoder.model)
     if args.grad_checkpoint:
-        _enable_gradient_checkpointing_esm(model.protein_encoder.model)
+        if args.manual_protein_features:
+            print("grad_checkpoint=skipped manual_protein_features=True", flush=True)
+        else:
+            _enable_gradient_checkpointing_esm(model.protein_encoder.model)
         model.compound_encoder.enable_gradient_checkpointing()
         _enable_gradient_checkpointing_cross_attn(model)
     configure_tuning(
@@ -1262,6 +1502,36 @@ def main() -> None:
     generator = torch.Generator().manual_seed(args.seed)
     train_set, test_set = random_split(
         dataset, [train_len, test_len], generator=generator)
+    if args.manual_protein_features:
+        mean, std, invalid_count, valid_count = _compute_manual_protein_feature_stats(train_set)
+        model.protein_encoder.set_normalization(mean, std)
+        print(
+            "manual_protein_features=enabled "
+            f"normalize=standard valid_sequences={valid_count} "
+            f"invalid_sequences={invalid_count}",
+            flush=True,
+        )
+        if wandb_run is not None:
+            wandb_run.config.update({
+                "manual_protein_features": True,
+                "manual_protein_valid_sequences": valid_count,
+                "manual_protein_invalid_sequences": invalid_count,
+            })
+    if args.manual_compound_features:
+        mean, std, invalid_count, valid_count = _compute_manual_compound_feature_stats(train_set)
+        model.compound_encoder.set_normalization(mean, std)
+        print(
+            "manual_compound_features=enabled "
+            f"normalize=standard valid_smiles={valid_count} "
+            f"invalid_smiles={invalid_count}",
+            flush=True,
+        )
+        if wandb_run is not None:
+            wandb_run.config.update({
+                "manual_compound_features": True,
+                "manual_compound_valid_smiles": valid_count,
+                "manual_compound_invalid_smiles": invalid_count,
+            })
     train_loader = DataLoader(
         train_set,
         batch_size=args.batch_size,
