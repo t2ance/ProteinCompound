@@ -1004,7 +1004,7 @@ class ProteinCompoundClassifier(nn.Module):
         hidden_dim: int = 512,
         num_heads: int = 8,
         mlp_hidden: int = 256,
-        dropout: float = 0.1,
+        dropout: float = 0.0,
         fusion_mode: str = "xattn",
     ):
         super().__init__()
@@ -1479,9 +1479,9 @@ def main() -> None:
     for key, value in label_counts.items():
         print(f"dataset/label_{key}={int(value)}")
 
-    _plot_length_distributions(
-        df, os.path.dirname(args.data_csv) or ".", wandb_run, wandb_module
-    )
+    # _plot_length_distributions(
+    #     df, os.path.dirname(args.data_csv) or ".", wandb_run, wandb_module
+    # )
     if args.max_samples:
         print(
             f"sampling {args.max_samples} rows from {len(df)} total rows, seed={args.seed}")
