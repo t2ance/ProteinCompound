@@ -2,7 +2,7 @@
 import argparse
 import os
 import sys
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -13,22 +13,7 @@ from contextlib import nullcontext
 import wandb
 from tqdm import tqdm
 
-_MANUAL_FEATURE_MODULE = None
-
-
-def _get_manual_feature_module():
-    global _MANUAL_FEATURE_MODULE
-    if _MANUAL_FEATURE_MODULE is None:
-        try:
-            import main_ml as manual_features
-        except Exception as exc:
-            raise ImportError(
-                "Failed to import manual feature helpers from main_ml.py; "
-                "ensure its dependencies are installed."
-            ) from exc
-        _MANUAL_FEATURE_MODULE = manual_features
-    return _MANUAL_FEATURE_MODULE
-
+import main_ml
 def _ensure_repo_path(repo_root: str, label: str) -> None:
     if not repo_root:
         raise ValueError(f"{label} is required.")
@@ -44,10 +29,7 @@ def _load_esm(
     checkpoint_path: Optional[str],
 ) -> Tuple[object, object]:
     _ensure_repo_path(esm_root, "esm_root")
-    try:
-        import esm
-    except ImportError as exc:
-        raise ImportError("Failed to import ESM; check esm_root.") from exc
+    import esm
     if checkpoint_path:
         print(f"loading_esm_checkpoint={checkpoint_path}", flush=True)
         if not os.path.isfile(checkpoint_path):
@@ -71,14 +53,8 @@ def _load_esm(
 
 
 def _smiles_to_graph(smiles: str):
-    try:
-        from torch_geometric.data import Data
-    except ImportError as exc:
-        raise ImportError("Missing dependency: torch-geometric.") from exc
-    try:
-        from dataset.smiles2graph import smiles2graph
-    except ImportError as exc:
-        raise ImportError("Failed to import DrugChat smiles2graph.") from exc
+    from torch_geometric.data import Data
+    from dataset.smiles2graph import smiles2graph
 
     graph = smiles2graph(smiles)
     return Data(
@@ -89,10 +65,7 @@ def _smiles_to_graph(smiles: str):
 
 
 def _smiles_to_batch(smiles_list: List[str]):
-    try:
-        from torch_geometric.data import Batch
-    except ImportError as exc:
-        raise ImportError("Missing dependency: torch-geometric.") from exc
+    from torch_geometric.data import Batch
     graphs = [_smiles_to_graph(smiles) for smiles in smiles_list]
     return Batch.from_data_list(graphs)
 
@@ -212,67 +185,12 @@ def _binary_metrics(preds: torch.Tensor, labels: torch.Tensor) -> dict:
         "recall": recall,
         "f1": f1,
     }
+    from sklearn.metrics import roc_auc_score
     try:
-        from sklearn.metrics import roc_auc_score
-    except Exception:
-        roc_auc_score = None
-    if roc_auc_score is not None:
-        try:
-            metrics["roc_auc"] = float(roc_auc_score(
-                labels_int.numpy(), preds.numpy()))
-        except ValueError:
-            metrics["roc_auc"] = float("nan")
+        metrics["roc_auc"] = float(roc_auc_score(labels_int.numpy(), preds.numpy()))
+    except ValueError:
+        metrics["roc_auc"] = float("nan")
     return metrics
-
-
-def _plot_length_distributions(
-    df: pd.DataFrame,
-    out_dir: str,
-    wandb_run=None,
-    wandb_module=None,
-) -> None:
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError as exc:
-        raise ImportError("Missing dependency: matplotlib.") from exc
-    os.makedirs(out_dir, exist_ok=True)
-    rna_lengths = df["rna_sequence"].astype(str).str.len()
-    smiles_lengths = df["smiles_sequence"].astype(str).str.len()
-
-    plt.figure(figsize=(6, 4))
-    plt.hist(rna_lengths, bins=50, color="#4c78a8", alpha=0.85)
-    plt.xlabel("RNA sequence length")
-    plt.ylabel("Count")
-    plt.tight_layout()
-    rna_path = os.path.join(out_dir, "rna_length_hist.png")
-    plt.savefig(rna_path, dpi=150)
-    plt.close()
-
-    plt.figure(figsize=(6, 4))
-    plt.hist(smiles_lengths, bins=50, color="#f58518", alpha=0.85)
-    plt.xlabel("SMILES length")
-    plt.ylabel("Count")
-    plt.tight_layout()
-    smiles_path = os.path.join(out_dir, "smiles_length_hist.png")
-    plt.savefig(smiles_path, dpi=150)
-    plt.close()
-
-    if wandb_run is not None and wandb_module is not None:
-        wandb_run.log(
-            {
-                "lengths/rna_hist": wandb_module.Histogram(
-                    rna_lengths.to_numpy()
-                ),
-                "lengths/smiles_hist": wandb_module.Histogram(
-                    smiles_lengths.to_numpy()
-                ),
-                "lengths/rna_plot": wandb_module.Image(rna_path),
-                "lengths/smiles_plot": wandb_module.Image(smiles_path),
-                "lengths/rna_mean": float(rna_lengths.mean()),
-                "lengths/smiles_mean": float(smiles_lengths.mean()),
-            }
-        )
-
 
 def train_epoch(
     model: nn.Module,
@@ -541,8 +459,7 @@ class ProteinEncoderESM(nn.Module):
 class ManualProteinEncoder(nn.Module):
     def __init__(self, normalize: bool = True):
         super().__init__()
-        self._manual_module = _get_manual_feature_module()
-        self.embedding_dim = len(self._manual_module.AMINO_ACIDS)
+        self.embedding_dim = len(main_ml.AMINO_ACIDS)
         self.normalize = normalize
         self.register_buffer(
             "feature_mean",
@@ -569,7 +486,7 @@ class ManualProteinEncoder(nn.Module):
         features = []
         invalid_mask = []
         for sequence in sequences:
-            feats = self._manual_module.extract_protein_features(sequence)
+            feats = main_ml.extract_protein_features(sequence)
             if np.isclose(feats.sum(), 0.0):
                 features.append(np.zeros(self.embedding_dim, dtype=np.float32))
                 invalid_mask.append(True)
@@ -597,8 +514,7 @@ class ManualProteinEncoder(nn.Module):
 class ManualCompoundEncoder(nn.Module):
     def __init__(self, normalize: bool = True):
         super().__init__()
-        self._manual_module = _get_manual_feature_module()
-        self.embedding_dim = len(self._manual_module.COMPOUND_DESCRIPTORS)
+        self.embedding_dim = len(main_ml.COMPOUND_DESCRIPTORS)
         self.normalize = normalize
         self.register_buffer(
             "feature_mean",
@@ -625,7 +541,7 @@ class ManualCompoundEncoder(nn.Module):
         features = []
         invalid_mask = []
         for smiles in smiles_list:
-            feats = self._manual_module.extract_compound_features(smiles)
+            feats = main_ml.extract_compound_features(smiles)
             if feats is None:
                 features.append(np.zeros(self.embedding_dim, dtype=np.float32))
                 invalid_mask.append(True)
@@ -662,12 +578,7 @@ class DrugChatCompoundEncoder(nn.Module):
     ):
         super().__init__()
         _ensure_repo_path(drugchat_root, "drugchat_root")
-        try:
-            from pipeline.models.gnn import GNN_graphpred
-        except ImportError as exc:
-            raise ImportError(
-                "Failed to import DrugChat GNN; ensure DrugChat dependencies are installed."
-            ) from exc
+        from pipeline.models.gnn import GNN_graphpred
         self.gnn = GNN_graphpred(
             num_layer,
             emb_dim,
@@ -783,10 +694,7 @@ def _apply_lora(
 ) -> nn.Module:
     if not target_modules:
         return module
-    try:
-        from peft import inject_adapter_in_model, LoraConfig
-    except ImportError as exc:
-        raise ImportError("Missing dependency: peft.") from exc
+    from peft import inject_adapter_in_model, LoraConfig
 
     config = LoraConfig(
         r=r,
@@ -816,10 +724,7 @@ def _apply_sdpa_to_esm(model) -> None:
         print("sdpa_unavailable=no_scaled_dot_product_attention", flush=True)
         return
 
-    try:
-        from esm import multihead_attention as esm_mha
-    except ImportError as exc:
-        raise ImportError("Failed to import ESM for SDPA.") from exc
+    from esm import multihead_attention as esm_mha
 
     if getattr(esm_mha, "_sdpa_patched", False):
         return
@@ -1020,10 +925,7 @@ def _enable_gradient_checkpointing_cross_attn(model) -> None:
 
 
 def _init_wandb(args):
-    try:
-        import wandb
-    except ImportError as exc:
-        raise ImportError("Missing dependency: wandb.") from exc
+    import wandb
     tags = _parse_list(args.wandb_tags)
     run = wandb.init(
         project=args.wandb_project,
@@ -1041,58 +943,6 @@ def _amp_context(device: torch.device, amp_mode: str):
         return nullcontext()
     dtype = torch.float16 if amp_mode == "fp16" else torch.bfloat16
     return torch.cuda.amp.autocast(dtype=dtype)
-
-
-def _compute_manual_compound_feature_stats(dataset: Dataset) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
-    manual_module = _get_manual_feature_module()
-    features = []
-    invalid_count = 0
-    for _, smiles, _ in dataset:
-        feats = manual_module.extract_compound_features(smiles)
-        if feats is None:
-            invalid_count += 1
-            continue
-        features.append(feats)
-    if not features:
-        print(
-            "WARNING: no valid SMILES for manual compound normalization; "
-            "using zeros/ones.",
-            file=sys.stderr,
-        )
-        mean = np.zeros(len(manual_module.COMPOUND_DESCRIPTORS), dtype=np.float32)
-        std = np.ones(len(manual_module.COMPOUND_DESCRIPTORS), dtype=np.float32)
-        return torch.from_numpy(mean), torch.from_numpy(std), invalid_count, 0
-    feats_np = np.stack(features, axis=0).astype(np.float32)
-    mean = feats_np.mean(axis=0)
-    std = feats_np.std(axis=0)
-    std[std == 0] = 1.0
-    return torch.from_numpy(mean), torch.from_numpy(std), invalid_count, len(features)
-
-
-def _compute_manual_protein_feature_stats(dataset: Dataset) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
-    manual_module = _get_manual_feature_module()
-    features = []
-    invalid_count = 0
-    for sequence, _, _ in dataset:
-        feats = manual_module.extract_protein_features(sequence)
-        if np.isclose(feats.sum(), 0.0):
-            invalid_count += 1
-            continue
-        features.append(feats)
-    if not features:
-        print(
-            "WARNING: no valid protein sequences for manual normalization; "
-            "using zeros/ones.",
-            file=sys.stderr,
-        )
-        mean = np.zeros(len(manual_module.AMINO_ACIDS), dtype=np.float32)
-        std = np.ones(len(manual_module.AMINO_ACIDS), dtype=np.float32)
-        return torch.from_numpy(mean), torch.from_numpy(std), invalid_count, 0
-    feats_np = np.stack(features, axis=0).astype(np.float32)
-    mean = feats_np.mean(axis=0)
-    std = feats_np.std(axis=0)
-    std[std == 0] = 1.0
-    return torch.from_numpy(mean), torch.from_numpy(std), invalid_count, len(features)
 
 
 def _precompute_embeddings(
@@ -1371,6 +1221,260 @@ def configure_tuning(
             )
 
 
+def load_and_prepare_dataset(
+    data_csv: str,
+    max_rna_length: int,
+    max_samples: Optional[int],
+    seed: int,
+    wandb_run=None,
+) -> pd.DataFrame:
+    """
+    Load dataset from CSV, filter invalid samples, and prepare for training.
+
+    Returns:
+        Filtered and shuffled DataFrame
+    """
+    df = pd.read_csv(data_csv)
+    df["rna_sequence"] = df["rna_sequence"].fillna("")
+    df["smiles_sequence"] = df["smiles_sequence"].fillna("")
+
+    # Log initial statistics
+    empty_rna = (df["rna_sequence"] == "").sum()
+    empty_smiles = (df["smiles_sequence"] == "").sum()
+    empty_any = ((df["rna_sequence"] == "") | (df["smiles_sequence"] == "")).sum()
+
+    print(
+        f"dataset_rows={len(df)} empty_rna={int(empty_rna)} "
+        f"empty_smiles={int(empty_smiles)} empty_any={int(empty_any)}"
+    )
+    print(
+        f"dataset/rows={len(df)} "
+        f"dataset/empty_rna={int(empty_rna)} "
+        f"dataset/empty_smiles={int(empty_smiles)} "
+        f"dataset/empty_any={int(empty_any)}"
+    )
+
+    # Filter out empty sequences
+    df = df[(df["rna_sequence"] != "") & (df["smiles_sequence"] != "")]
+    print(f"filtered_rows={len(df)}")
+    print(f"dataset/filtered_rows={len(df)}")
+
+    # Filter by RNA sequence length
+    rna_lengths = df["rna_sequence"].astype(str).str.len()
+    too_long = (rna_lengths > max_rna_length).sum()
+    print(f"max_rna_length={max_rna_length}")
+
+    if too_long > 0:
+        print(f"Discarding {int(too_long)} samples with RNA length > {max_rna_length}")
+        df = df[rna_lengths <= max_rna_length]
+        print(f"dataset/discarded_long_rna={int(too_long)}")
+        print(f"dataset/after_length_filter={len(df)}")
+    else:
+        print(f"All samples within max_rna_length={max_rna_length}")
+
+    # Log to WandB if enabled
+    if wandb_run is not None:
+        wandb_run.config.update({
+            "max_rna_length": max_rna_length,
+            "discarded_long_rna": int(too_long),
+            "samples_after_length_filter": len(df),
+        })
+
+    # Log label distribution
+    label_counts = df["label"].value_counts().to_dict()
+    for key, value in label_counts.items():
+        print(f"dataset/label_{key}={int(value)}")
+
+    # Sample if requested
+    if max_samples:
+        print(f"sampling {max_samples} rows from {len(df)} total rows, seed={seed}")
+        df = df.sample(n=min(max_samples, len(df)), random_state=seed)
+
+    # Shuffle the dataset
+    print(f"shuffling dataset, seed={seed}")
+    df = df.sample(frac=1, random_state=seed).reset_index(drop=True)
+
+    return df
+
+
+def load_cached_datasets(
+    cached_embeddings_dir: str,
+    train_split: float,
+    seed: int,
+) -> Tuple[Dataset, Dataset]:
+    """
+    Load datasets from cached embeddings directory.
+
+    Returns:
+        train_set, test_set
+    """
+    print(f"Loading cached embeddings from {cached_embeddings_dir}")
+    if not os.path.exists(cached_embeddings_dir):
+        raise FileNotFoundError(f"Cached embeddings directory not found: {cached_embeddings_dir}")
+
+    cache_metadata_path = os.path.join(cached_embeddings_dir, "metadata.pt")
+    cache_metadata = torch.load(cache_metadata_path)
+    num_cached_samples = cache_metadata['num_samples']
+    print(f"Found {num_cached_samples} cached samples")
+
+    # Split indices for cached embeddings
+    all_indices = list(range(num_cached_samples))
+    torch.manual_seed(seed)
+    import random
+    random.seed(seed)
+    random.shuffle(all_indices)
+
+    train_len = int(num_cached_samples * train_split)
+    train_len = max(min(train_len, num_cached_samples - 1), 1)
+    test_len = num_cached_samples - train_len
+
+    train_indices = all_indices[:train_len]
+    test_indices = all_indices[train_len:]
+
+    print(f"train_len={train_len} test_len={test_len}")
+
+    train_set = CachedEmbeddingDataset(cached_embeddings_dir, train_indices)
+    test_set = CachedEmbeddingDataset(cached_embeddings_dir, test_indices)
+
+    return train_set, test_set
+
+
+def load_csv_datasets(
+    model: ProteinCompoundClassifier,
+    data_csv: str,
+    max_rna_length: int,
+    max_samples: Optional[int],
+    train_split: float,
+    seed: int,
+    use_manual_protein: bool,
+    use_manual_compound: bool,
+    wandb_run=None,
+) -> Tuple[Dataset, Dataset]:
+    """
+    Load datasets from CSV file, including normalization setup.
+
+    Returns:
+        train_set, test_set
+    """
+    df = load_and_prepare_dataset(
+        data_csv=data_csv,
+        max_rna_length=max_rna_length,
+        max_samples=max_samples,
+        seed=seed,
+        wandb_run=wandb_run,
+    )
+
+    # Create dataset
+    dataset = PairDataset(df)
+    if len(dataset) < 2:
+        raise RuntimeError("Dataset too small after filtering.")
+
+    # Split dataset
+    train_len = int(len(dataset) * train_split)
+    train_len = max(min(train_len, len(dataset) - 1), 1)
+    test_len = len(dataset) - train_len
+
+    print(f"train_len={train_len} test_len={test_len}")
+
+    generator = torch.Generator().manual_seed(seed)
+    train_set, test_set = random_split(
+        dataset, [train_len, test_len], generator=generator
+    )
+
+    # Setup manual feature normalization
+    if use_manual_protein:
+        features = []
+        invalid_count = 0
+        for sequence, _, _ in train_set:
+            feats = main_ml.extract_protein_features(sequence)
+            if not np.isclose(feats.sum(), 0.0):
+                features.append(feats)
+            else:
+                invalid_count += 1
+        if features:
+            feats_np = np.stack(features, axis=0).astype(np.float32)
+            mean, std = feats_np.mean(axis=0), feats_np.std(axis=0)
+            std[std == 0] = 1.0
+            model.protein_encoder.set_normalization(torch.from_numpy(mean), torch.from_numpy(std))
+            print(f"manual_protein_features=enabled normalize=standard valid_sequences={len(features)} invalid_sequences={invalid_count}", flush=True)
+            if wandb_run is not None:
+                wandb_run.config.update({"manual_protein_features": True, "manual_protein_valid_sequences": len(features), "manual_protein_invalid_sequences": invalid_count})
+        else:
+            print("WARNING: no valid protein sequences for manual normalization; using zeros/ones.", file=sys.stderr)
+
+    if use_manual_compound:
+        features = []
+        invalid_count = 0
+        for _, smiles, _ in train_set:
+            feats = main_ml.extract_compound_features(smiles)
+            if feats is not None:
+                features.append(feats)
+            else:
+                invalid_count += 1
+        if features:
+            feats_np = np.stack(features, axis=0).astype(np.float32)
+            mean, std = feats_np.mean(axis=0), feats_np.std(axis=0)
+            std[std == 0] = 1.0
+            model.compound_encoder.set_normalization(torch.from_numpy(mean), torch.from_numpy(std))
+            print(f"manual_compound_features=enabled normalize=standard valid_smiles={len(features)} invalid_smiles={invalid_count}", flush=True)
+            if wandb_run is not None:
+                wandb_run.config.update({"manual_compound_features": True, "manual_compound_valid_smiles": len(features), "manual_compound_invalid_smiles": invalid_count})
+        else:
+            print("WARNING: no valid SMILES for manual compound normalization; using zeros/ones.", file=sys.stderr)
+
+    return train_set, test_set
+
+
+def setup_embeddings_and_collate(
+    model: ProteinCompoundClassifier,
+    train_set: Dataset,
+    test_set: Dataset,
+    device: torch.device,
+    tuning_mode: str,
+    batch_size: int,
+    use_cached_from_disk: bool,
+    cached_embeddings_dir: Optional[str] = None,
+) -> Tuple[Dataset, Dataset, Callable, bool]:
+    """
+    Setup embedding precomputation strategy and appropriate collate function.
+
+    Returns:
+        train_set (potentially replaced with precomputed),
+        test_set (potentially replaced with precomputed),
+        collate_fn,
+        use_precomputed_embeddings (bool)
+    """
+    use_precomputed_embeddings = False
+
+    if use_cached_from_disk:
+        print(f"Using cached embeddings from disk: {cached_embeddings_dir}")
+        use_precomputed_embeddings = True
+        collate_fn = _collate_precomputed_batch
+    elif tuning_mode == "head":
+        print("tuning_mode=head: Pre-computing embeddings in memory...")
+
+        train_set = _precompute_embeddings(
+            model, train_set, device,
+            batch_size=batch_size,
+            desc="Pre-computing train embeddings"
+        )
+
+        test_set = _precompute_embeddings(
+            model, test_set, device,
+            batch_size=batch_size,
+            desc="Pre-computing test embeddings"
+        )
+
+        use_precomputed_embeddings = True
+        collate_fn = _collate_precomputed_batch
+
+        print(f"Pre-computation complete. Training on {len(train_set)} samples, testing on {len(test_set)} samples.")
+    else:
+        collate_fn = _collate_batch
+
+    return train_set, test_set, collate_fn, use_precomputed_embeddings
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Protein-compound classifier with ESM + DrugChat.")
@@ -1532,31 +1636,6 @@ def main() -> None:
 
     use_cached_embeddings_from_disk = args.cached_embeddings_dir is not None
 
-    if use_cached_embeddings_from_disk:
-        print(f"Loading cached embeddings from {args.cached_embeddings_dir}")
-        if not os.path.exists(args.cached_embeddings_dir):
-            raise FileNotFoundError(f"Cached embeddings directory not found: {args.cached_embeddings_dir}")
-
-        cache_metadata_path = os.path.join(args.cached_embeddings_dir, "metadata.pt")
-        cache_metadata = torch.load(cache_metadata_path)
-        num_cached_samples = cache_metadata['num_samples']
-        print(f"Found {num_cached_samples} cached samples")
-
-        all_indices = list(range(num_cached_samples))
-        torch.manual_seed(args.seed)
-        import random
-        random.seed(args.seed)
-        random.shuffle(all_indices)
-
-        train_len = int(num_cached_samples * args.train_split)
-        train_len = max(min(train_len, num_cached_samples - 1), 1)
-        test_len = num_cached_samples - train_len
-
-        train_indices = all_indices[:train_len]
-        test_indices = all_indices[train_len:]
-
-        print(f"train_len={train_len} test_len={test_len}")
-
     model = build_model(
         drugchat_root=args.drugchat_root,
         gnn_checkpoint=args.gnn_checkpoint,
@@ -1572,10 +1651,9 @@ def main() -> None:
         manual_protein_features=args.manual_protein_features,
     )
     if args.manual_protein_features:
-        manual_module = _get_manual_feature_module()
         print(
             "protein_encoder=manual "
-            f"features={len(manual_module.AMINO_ACIDS)} normalize=standard",
+            f"features={len(main_ml.AMINO_ACIDS)} normalize=standard",
             flush=True,
         )
     else:
@@ -1585,10 +1663,9 @@ def main() -> None:
             flush=True,
         )
     if args.manual_compound_features:
-        manual_module = _get_manual_feature_module()
         print(
             "compound_encoder=manual "
-            f"descriptors={','.join(manual_module.COMPOUND_DESCRIPTORS)} "
+            f"descriptors={','.join(main_ml.COMPOUND_DESCRIPTORS)} "
             "normalize=standard",
             flush=True,
         )
@@ -1638,142 +1715,37 @@ def main() -> None:
 
     torch.manual_seed(args.seed)
 
-    if not use_cached_embeddings_from_disk:
-        df = pd.read_csv(args.data_csv)
-        df["rna_sequence"] = df["rna_sequence"].fillna("")
-        df["smiles_sequence"] = df["smiles_sequence"].fillna("")
-        empty_rna = (df["rna_sequence"] == "").sum()
-        empty_smiles = (df["smiles_sequence"] == "").sum()
-        empty_any = ((df["rna_sequence"] == "") | (
-            df["smiles_sequence"] == "")).sum()
-        print(
-            "dataset_rows="
-            f"{len(df)} empty_rna={int(empty_rna)} "
-            f"empty_smiles={int(empty_smiles)} empty_any={int(empty_any)}"
-        )
-        print(
-            f"dataset/rows={len(df)} "
-            f"dataset/empty_rna={int(empty_rna)} "
-            f"dataset/empty_smiles={int(empty_smiles)} "
-            f"dataset/empty_any={int(empty_any)}"
-        )
-        df = df[(df["rna_sequence"] != "") & (df["smiles_sequence"] != "")]
-        print(f"filtered_rows={len(df)}")
-        print(f"dataset/filtered_rows={len(df)}")
-
-        # Filter by RNA sequence length
-        rna_lengths = df["rna_sequence"].astype(str).str.len()
-        too_long = (rna_lengths > args.max_rna_length).sum()
-        print(f"max_rna_length={args.max_rna_length}")
-        if too_long > 0:
-            print(f"Discarding {int(too_long)} samples with RNA length > {args.max_rna_length}")
-            df = df[rna_lengths <= args.max_rna_length]
-            print(f"dataset/discarded_long_rna={int(too_long)}")
-            print(f"dataset/after_length_filter={len(df)}")
-        else:
-            print(f"All samples within max_rna_length={args.max_rna_length}")
-
-        # Log to WandB if enabled
-        if wandb_run is not None:
-            wandb_run.config.update({
-                "max_rna_length": args.max_rna_length,
-                "discarded_long_rna": int(too_long),
-                "samples_after_length_filter": len(df),
-            })
-
-        label_counts = df["label"].value_counts().to_dict()
-        for key, value in label_counts.items():
-            print(f"dataset/label_{key}={int(value)}")
-
-        # _plot_length_distributions(
-        #     df, os.path.dirname(args.data_csv) or ".", wandb_run, wandb_module
-        # )
-        if args.max_samples:
-            print(
-                f"sampling {args.max_samples} rows from {len(df)} total rows, seed={args.seed}")
-            df = df.sample(n=min(args.max_samples, len(df)),
-                           random_state=args.seed)
-
-        # Shuffle the dataset before train/test split
-        print(f"shuffling dataset, seed={args.seed}")
-        df = df.sample(frac=1, random_state=args.seed).reset_index(drop=True)
-
-        dataset = PairDataset(df)
-        if len(dataset) < 2:
-            raise RuntimeError("Dataset too small after filtering.")
-        train_len = int(len(dataset) * args.train_split)
-        train_len = max(min(train_len, len(dataset) - 1), 1)
-        test_len = len(dataset) - train_len
-        print(f"train_len={train_len} test_len={test_len}")
-        generator = torch.Generator().manual_seed(args.seed)
-        train_set, test_set = random_split(
-            dataset, [train_len, test_len], generator=generator)
-    else:
-        train_set = CachedEmbeddingDataset(args.cached_embeddings_dir, train_indices)
-        test_set = CachedEmbeddingDataset(args.cached_embeddings_dir, test_indices)
-
-    if not use_cached_embeddings_from_disk:
-        if args.manual_protein_features:
-            mean, std, invalid_count, valid_count = _compute_manual_protein_feature_stats(train_set)
-            model.protein_encoder.set_normalization(mean, std)
-            print(
-                "manual_protein_features=enabled "
-                f"normalize=standard valid_sequences={valid_count} "
-                f"invalid_sequences={invalid_count}",
-                flush=True,
-            )
-            if wandb_run is not None:
-                wandb_run.config.update({
-                    "manual_protein_features": True,
-                    "manual_protein_valid_sequences": valid_count,
-                    "manual_protein_invalid_sequences": invalid_count,
-                })
-        if args.manual_compound_features:
-            mean, std, invalid_count, valid_count = _compute_manual_compound_feature_stats(train_set)
-            model.compound_encoder.set_normalization(mean, std)
-            print(
-                "manual_compound_features=enabled "
-                f"normalize=standard valid_smiles={valid_count} "
-                f"invalid_smiles={invalid_count}",
-                flush=True,
-            )
-            if wandb_run is not None:
-                wandb_run.config.update({
-                    "manual_compound_features": True,
-                    "manual_compound_valid_smiles": valid_count,
-                    "manual_compound_invalid_smiles": invalid_count,
-                })
-
-    use_precomputed_embeddings = False
-
+    # Load datasets (either from cache or CSV)
     if use_cached_embeddings_from_disk:
-        print(f"Using cached embeddings from disk: {args.cached_embeddings_dir}")
-        use_precomputed_embeddings = True
-    elif args.tuning_mode == "head":
-        print("tuning_mode=head: Pre-computing embeddings in memory...")
-
-        train_set_precomputed = _precompute_embeddings(
-            model, train_set, device,
-            batch_size=args.batch_size,
-            desc="Pre-computing train embeddings"
+        train_set, test_set = load_cached_datasets(
+            cached_embeddings_dir=args.cached_embeddings_dir,
+            train_split=args.train_split,
+            seed=args.seed,
         )
-
-        test_set_precomputed = _precompute_embeddings(
-            model, test_set, device,
-            batch_size=args.batch_size,
-            desc="Pre-computing test embeddings"
-        )
-
-        train_set = train_set_precomputed
-        test_set = test_set_precomputed
-        use_precomputed_embeddings = True
-
-        print(f"Pre-computation complete. Training on {len(train_set)} samples, testing on {len(test_set)} samples.")
-
-    if use_precomputed_embeddings:
-        collate_fn = _collate_precomputed_batch
     else:
-        collate_fn = _collate_batch
+        train_set, test_set = load_csv_datasets(
+            model=model,
+            data_csv=args.data_csv,
+            max_rna_length=args.max_rna_length,
+            max_samples=args.max_samples,
+            train_split=args.train_split,
+            seed=args.seed,
+            use_manual_protein=args.manual_protein_features,
+            use_manual_compound=args.manual_compound_features,
+            wandb_run=wandb_run,
+        )
+
+    # Setup embeddings and collate function
+    train_set, test_set, collate_fn, use_precomputed_embeddings = setup_embeddings_and_collate(
+        model=model,
+        train_set=train_set,
+        test_set=test_set,
+        device=device,
+        tuning_mode=args.tuning_mode,
+        batch_size=args.batch_size,
+        use_cached_from_disk=use_cached_embeddings_from_disk,
+        cached_embeddings_dir=args.cached_embeddings_dir,
+    )
 
     train_loader = DataLoader(
         train_set,
