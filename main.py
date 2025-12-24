@@ -114,9 +114,80 @@ class PairDataset(Dataset):
         return self.rna[idx], self.smiles[idx], self.labels[idx]
 
 
+class PrecomputedEmbeddingDataset(Dataset):
+    def __init__(self, embeddings_list: List[Tuple]):
+        self.embeddings = embeddings_list
+
+    def __len__(self) -> int:
+        return len(self.embeddings)
+
+    def __getitem__(self, idx: int):
+        return self.embeddings[idx]
+
+
+class CachedEmbeddingDataset(Dataset):
+    def __init__(self, cache_dir: str, indices: Optional[List[int]] = None):
+        self.cache_dir = cache_dir
+        metadata_path = os.path.join(cache_dir, "metadata.pt")
+        if not os.path.exists(metadata_path):
+            raise FileNotFoundError(f"Cache metadata not found: {metadata_path}")
+
+        self.metadata = torch.load(metadata_path)
+        self.num_samples = self.metadata['num_samples']
+
+        if indices is None:
+            self.indices = list(range(self.num_samples))
+        else:
+            self.indices = indices
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, idx: int):
+        actual_idx = self.indices[idx]
+        sample_path = os.path.join(self.cache_dir, f"sample_{actual_idx:06d}.pt")
+        sample_data = torch.load(sample_path)
+        return (
+            sample_data['prot_emb'],
+            sample_data['prot_mask'],
+            sample_data['comp_emb'],
+            sample_data['comp_mask'],
+            sample_data['label']
+        )
+
+
 def _collate_batch(batch):
     rna, smiles, labels = zip(*batch)
     return list(rna), list(smiles), torch.tensor(labels, dtype=torch.float32)
+
+
+def _collate_precomputed_batch(batch):
+    prot_embs, prot_masks, comp_embs, comp_masks, labels = zip(*batch)
+
+    max_prot_len = max(e.size(0) for e in prot_embs)
+    max_comp_len = max(e.size(0) for e in comp_embs)
+
+    prot_dim = prot_embs[0].size(1)
+    comp_dim = comp_embs[0].size(1)
+    batch_size = len(batch)
+
+    padded_prot = torch.zeros(batch_size, max_prot_len, prot_dim)
+    padded_prot_mask = torch.ones(batch_size, max_prot_len, dtype=torch.bool)
+    padded_comp = torch.zeros(batch_size, max_comp_len, comp_dim)
+    padded_comp_mask = torch.ones(batch_size, max_comp_len, dtype=torch.bool)
+
+    for i, (prot_emb, prot_mask, comp_emb, comp_mask) in enumerate(zip(prot_embs, prot_masks, comp_embs, comp_masks)):
+        prot_len = prot_emb.size(0)
+        comp_len = comp_emb.size(0)
+
+        padded_prot[i, :prot_len] = prot_emb
+        padded_prot_mask[i, :prot_len] = prot_mask
+        padded_comp[i, :comp_len] = comp_emb
+        padded_comp_mask[i, :comp_len] = comp_mask
+
+    labels_tensor = torch.tensor(labels, dtype=torch.float32)
+
+    return padded_prot, padded_prot_mask, padded_comp, padded_comp_mask, labels_tensor
 
 
 def _binary_metrics(preds: torch.Tensor, labels: torch.Tensor) -> dict:
@@ -215,17 +286,31 @@ def train_epoch(
     wandb_run: Optional[wandb.Run] = None,
     grad_clip: Optional[float] = None,
     scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+    use_precomputed_embeddings: bool = False,
 ) -> float:
     model.train()
     total_loss = 0.0
     loss_fn = nn.BCEWithLogitsLoss()
     optimizer.zero_grad(set_to_none=True)
-    for batch_idx, (rna, smiles, labels) in tqdm(enumerate(loader), total=len(loader), desc="Training"):
-        labels = labels.to(device)
-        with _amp_context(device, amp_mode):
-            # Disable debug for normal training
-            logits = model(rna, smiles, device=device, debug=False)
-            loss = loss_fn(logits, labels)
+    print('Using precomputed embeddings:', use_precomputed_embeddings)
+    for batch_idx, batch_data in enumerate(loader):
+
+        if use_precomputed_embeddings:
+            prot_emb, prot_mask, comp_emb, comp_mask, labels = batch_data
+            labels = labels.to(device)
+
+            with _amp_context(device, amp_mode):
+                logits = model.forward_from_embeddings(
+                    prot_emb, prot_mask, comp_emb, comp_mask, device, debug=False
+                )
+                loss = loss_fn(logits, labels)
+        else:
+            rna, smiles, labels = batch_data
+            labels = labels.to(device)
+
+            with _amp_context(device, amp_mode):
+                logits = model(rna, smiles, device=device, debug=False)
+                loss = loss_fn(logits, labels)
 
         # Scale loss for gradient accumulation (average instead of sum)
         scaled_loss = loss / accumulation_steps
@@ -237,11 +322,11 @@ def train_epoch(
         total_loss += loss.item() * labels.size(0)
 
         # Log batch loss to wandb
-        if wandb_run is not None and batch_idx % 10 == 0:
+        if wandb_run is not None and batch_idx % 50 == 0:
             wandb_run.log({"train/batch_loss": loss.item()})
 
         # Memory monitoring (log every 10 batches or when debugging)
-        if (batch_idx % 10 == 0 or debug) and device.type == "cuda":
+        if (batch_idx % 50 == 0 or debug) and device.type == "cuda":
             mem_allocated = torch.cuda.memory_allocated(device) / 1024**3
             mem_reserved = torch.cuda.memory_reserved(device) / 1024**3
             mem_free = (torch.cuda.get_device_properties(device).total_memory
@@ -364,6 +449,7 @@ def evaluate(
     loader: DataLoader,
     device: torch.device,
     amp_mode: str,
+    use_precomputed_embeddings: bool = False,
 ) -> Tuple[float, dict]:
     model.eval()
     total_loss = 0.0
@@ -371,11 +457,24 @@ def evaluate(
     all_probs = []
     all_labels = []
     with torch.no_grad():
-        for rna, smiles, labels in tqdm(loader, total=len(loader), desc="Evaluating"):
-            labels = labels.to(device)
-            with _amp_context(device, amp_mode):
-                logits = model(rna, smiles, device=device)
-                loss = loss_fn(logits, labels)
+        for batch_data in tqdm(loader, total=len(loader), desc="Evaluating"):
+
+            if use_precomputed_embeddings:
+                prot_emb, prot_mask, comp_emb, comp_mask, labels = batch_data
+                labels = labels.to(device)
+
+                with _amp_context(device, amp_mode):
+                    logits = model.forward_from_embeddings(
+                        prot_emb, prot_mask, comp_emb, comp_mask, device
+                    )
+                    loss = loss_fn(logits, labels)
+            else:
+                rna, smiles, labels = batch_data
+                labels = labels.to(device)
+
+                with _amp_context(device, amp_mode):
+                    logits = model(rna, smiles, device=device)
+                    loss = loss_fn(logits, labels)
             total_loss += loss.item() * labels.size(0)
             probs = torch.sigmoid(logits)
             all_probs.append(probs.cpu())
@@ -996,6 +1095,45 @@ def _compute_manual_protein_feature_stats(dataset: Dataset) -> Tuple[torch.Tenso
     return torch.from_numpy(mean), torch.from_numpy(std), invalid_count, len(features)
 
 
+def _precompute_embeddings(
+    model,
+    dataset: Dataset,
+    device: torch.device,
+    batch_size: int = 8,
+    desc: str = "Pre-computing embeddings"
+) -> PrecomputedEmbeddingDataset:
+    model.eval()
+    embeddings_list = []
+
+    temp_loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=_collate_batch
+    )
+
+    with torch.no_grad():
+        for rna_seqs, smiles_list, labels in tqdm(temp_loader, desc=desc):
+            prot_tokens, prot_pad = model.protein_encoder(rna_seqs, device)
+            comp_tokens, comp_pad = model.compound_encoder(smiles_list, device)
+
+            batch_size_actual = len(rna_seqs)
+            for i in range(batch_size_actual):
+                prot_len = (~prot_pad[i]).sum().item()
+                comp_len = (~comp_pad[i]).sum().item()
+
+                embeddings_list.append((
+                    prot_tokens[i, :prot_len].cpu(),
+                    prot_pad[i, :prot_len].cpu(),
+                    comp_tokens[i, :comp_len].cpu(),
+                    comp_pad[i, :comp_len].cpu(),
+                    labels[i].item()
+                ))
+
+    print(f"Pre-computed {len(embeddings_list)} samples")
+    return PrecomputedEmbeddingDataset(embeddings_list)
+
+
 class ProteinCompoundClassifier(nn.Module):
     def __init__(
         self,
@@ -1105,6 +1243,39 @@ class ProteinCompoundClassifier(nn.Module):
             print(f"\n[CLASSIFIER OUTPUT]")
             print(f"  logits: {logits.shape}, mean={logits.mean().item():.4f}, std={logits.std().item():.4f}")
 
+        return logits
+
+    def forward_from_embeddings(
+        self,
+        prot_tokens: torch.Tensor,
+        prot_pad: torch.Tensor,
+        comp_tokens: torch.Tensor,
+        comp_pad: torch.Tensor,
+        device: torch.device,
+        debug: bool = False
+    ) -> torch.Tensor:
+        prot_tokens = prot_tokens.to(device)
+        prot_pad = prot_pad.to(device)
+        comp_tokens = comp_tokens.to(device)
+        comp_pad = comp_pad.to(device)
+
+        prot_tokens = self.proj_protein(prot_tokens)
+        comp_tokens = self.proj_compound(comp_tokens)
+
+        if self.fusion_mode == "xattn":
+            fused, _ = self.cross_attn(
+                prot_tokens, comp_tokens, comp_tokens,
+                key_padding_mask=comp_pad,
+                need_weights=False,
+                average_attn_weights=True
+            )
+            pooled = _masked_mean(fused, prot_pad)
+        elif self.fusion_mode == "concat":
+            pooled_prot = _masked_mean(prot_tokens, prot_pad)
+            pooled_comp = _masked_mean(comp_tokens, comp_pad)
+            pooled = torch.cat([pooled_prot, pooled_comp], dim=-1)
+
+        logits = self.classifier(pooled).squeeze(-1)
         return logits
 
 
@@ -1346,6 +1517,11 @@ def main() -> None:
         default="concat",
         help="Fusion mode for combining protein and compound representations. 'concat': simple concatenation + MLP, 'xattn': cross-attention (original).",
     )
+    parser.add_argument(
+        "--cached-embeddings-dir",
+        default=None,
+        help="Directory containing cached embeddings (from extract_embeddings.py). If set, skips encoder initialization and loads pre-computed embeddings from disk.",
+    )
     args = parser.parse_args()
     if args.gradient_accumulation_steps < 1:
         raise ValueError("gradient_accumulation_steps must be >= 1")
@@ -1353,6 +1529,34 @@ def main() -> None:
     wandb_module = None
     if args.wandb:
         wandb_run, wandb_module = _init_wandb(args)
+
+    use_cached_embeddings_from_disk = args.cached_embeddings_dir is not None
+
+    if use_cached_embeddings_from_disk:
+        print(f"Loading cached embeddings from {args.cached_embeddings_dir}")
+        if not os.path.exists(args.cached_embeddings_dir):
+            raise FileNotFoundError(f"Cached embeddings directory not found: {args.cached_embeddings_dir}")
+
+        cache_metadata_path = os.path.join(args.cached_embeddings_dir, "metadata.pt")
+        cache_metadata = torch.load(cache_metadata_path)
+        num_cached_samples = cache_metadata['num_samples']
+        print(f"Found {num_cached_samples} cached samples")
+
+        all_indices = list(range(num_cached_samples))
+        torch.manual_seed(args.seed)
+        import random
+        random.seed(args.seed)
+        random.shuffle(all_indices)
+
+        train_len = int(num_cached_samples * args.train_split)
+        train_len = max(min(train_len, num_cached_samples - 1), 1)
+        test_len = num_cached_samples - train_len
+
+        train_indices = all_indices[:train_len]
+        test_indices = all_indices[train_len:]
+
+        print(f"train_len={train_len} test_len={test_len}")
+
     model = build_model(
         drugchat_root=args.drugchat_root,
         gnn_checkpoint=args.gnn_checkpoint,
@@ -1433,116 +1637,155 @@ def main() -> None:
     )
 
     torch.manual_seed(args.seed)
-    df = pd.read_csv(args.data_csv)
-    df["rna_sequence"] = df["rna_sequence"].fillna("")
-    df["smiles_sequence"] = df["smiles_sequence"].fillna("")
-    empty_rna = (df["rna_sequence"] == "").sum()
-    empty_smiles = (df["smiles_sequence"] == "").sum()
-    empty_any = ((df["rna_sequence"] == "") | (
-        df["smiles_sequence"] == "")).sum()
-    print(
-        "dataset_rows="
-        f"{len(df)} empty_rna={int(empty_rna)} "
-        f"empty_smiles={int(empty_smiles)} empty_any={int(empty_any)}"
-    )
-    print(
-        f"dataset/rows={len(df)} "
-        f"dataset/empty_rna={int(empty_rna)} "
-        f"dataset/empty_smiles={int(empty_smiles)} "
-        f"dataset/empty_any={int(empty_any)}"
-    )
-    df = df[(df["rna_sequence"] != "") & (df["smiles_sequence"] != "")]
-    print(f"filtered_rows={len(df)}")
-    print(f"dataset/filtered_rows={len(df)}")
 
-    # Filter by RNA sequence length
-    rna_lengths = df["rna_sequence"].astype(str).str.len()
-    too_long = (rna_lengths > args.max_rna_length).sum()
-    print(f"max_rna_length={args.max_rna_length}")
-    if too_long > 0:
-        print(f"Discarding {int(too_long)} samples with RNA length > {args.max_rna_length}")
-        df = df[rna_lengths <= args.max_rna_length]
-        print(f"dataset/discarded_long_rna={int(too_long)}")
-        print(f"dataset/after_length_filter={len(df)}")
+    if not use_cached_embeddings_from_disk:
+        df = pd.read_csv(args.data_csv)
+        df["rna_sequence"] = df["rna_sequence"].fillna("")
+        df["smiles_sequence"] = df["smiles_sequence"].fillna("")
+        empty_rna = (df["rna_sequence"] == "").sum()
+        empty_smiles = (df["smiles_sequence"] == "").sum()
+        empty_any = ((df["rna_sequence"] == "") | (
+            df["smiles_sequence"] == "")).sum()
+        print(
+            "dataset_rows="
+            f"{len(df)} empty_rna={int(empty_rna)} "
+            f"empty_smiles={int(empty_smiles)} empty_any={int(empty_any)}"
+        )
+        print(
+            f"dataset/rows={len(df)} "
+            f"dataset/empty_rna={int(empty_rna)} "
+            f"dataset/empty_smiles={int(empty_smiles)} "
+            f"dataset/empty_any={int(empty_any)}"
+        )
+        df = df[(df["rna_sequence"] != "") & (df["smiles_sequence"] != "")]
+        print(f"filtered_rows={len(df)}")
+        print(f"dataset/filtered_rows={len(df)}")
+
+        # Filter by RNA sequence length
+        rna_lengths = df["rna_sequence"].astype(str).str.len()
+        too_long = (rna_lengths > args.max_rna_length).sum()
+        print(f"max_rna_length={args.max_rna_length}")
+        if too_long > 0:
+            print(f"Discarding {int(too_long)} samples with RNA length > {args.max_rna_length}")
+            df = df[rna_lengths <= args.max_rna_length]
+            print(f"dataset/discarded_long_rna={int(too_long)}")
+            print(f"dataset/after_length_filter={len(df)}")
+        else:
+            print(f"All samples within max_rna_length={args.max_rna_length}")
+
+        # Log to WandB if enabled
+        if wandb_run is not None:
+            wandb_run.config.update({
+                "max_rna_length": args.max_rna_length,
+                "discarded_long_rna": int(too_long),
+                "samples_after_length_filter": len(df),
+            })
+
+        label_counts = df["label"].value_counts().to_dict()
+        for key, value in label_counts.items():
+            print(f"dataset/label_{key}={int(value)}")
+
+        # _plot_length_distributions(
+        #     df, os.path.dirname(args.data_csv) or ".", wandb_run, wandb_module
+        # )
+        if args.max_samples:
+            print(
+                f"sampling {args.max_samples} rows from {len(df)} total rows, seed={args.seed}")
+            df = df.sample(n=min(args.max_samples, len(df)),
+                           random_state=args.seed)
+
+        # Shuffle the dataset before train/test split
+        print(f"shuffling dataset, seed={args.seed}")
+        df = df.sample(frac=1, random_state=args.seed).reset_index(drop=True)
+
+        dataset = PairDataset(df)
+        if len(dataset) < 2:
+            raise RuntimeError("Dataset too small after filtering.")
+        train_len = int(len(dataset) * args.train_split)
+        train_len = max(min(train_len, len(dataset) - 1), 1)
+        test_len = len(dataset) - train_len
+        print(f"train_len={train_len} test_len={test_len}")
+        generator = torch.Generator().manual_seed(args.seed)
+        train_set, test_set = random_split(
+            dataset, [train_len, test_len], generator=generator)
     else:
-        print(f"All samples within max_rna_length={args.max_rna_length}")
+        train_set = CachedEmbeddingDataset(args.cached_embeddings_dir, train_indices)
+        test_set = CachedEmbeddingDataset(args.cached_embeddings_dir, test_indices)
 
-    # Log to WandB if enabled
-    if wandb_run is not None:
-        wandb_run.config.update({
-            "max_rna_length": args.max_rna_length,
-            "discarded_long_rna": int(too_long),
-            "samples_after_length_filter": len(df),
-        })
+    if not use_cached_embeddings_from_disk:
+        if args.manual_protein_features:
+            mean, std, invalid_count, valid_count = _compute_manual_protein_feature_stats(train_set)
+            model.protein_encoder.set_normalization(mean, std)
+            print(
+                "manual_protein_features=enabled "
+                f"normalize=standard valid_sequences={valid_count} "
+                f"invalid_sequences={invalid_count}",
+                flush=True,
+            )
+            if wandb_run is not None:
+                wandb_run.config.update({
+                    "manual_protein_features": True,
+                    "manual_protein_valid_sequences": valid_count,
+                    "manual_protein_invalid_sequences": invalid_count,
+                })
+        if args.manual_compound_features:
+            mean, std, invalid_count, valid_count = _compute_manual_compound_feature_stats(train_set)
+            model.compound_encoder.set_normalization(mean, std)
+            print(
+                "manual_compound_features=enabled "
+                f"normalize=standard valid_smiles={valid_count} "
+                f"invalid_smiles={invalid_count}",
+                flush=True,
+            )
+            if wandb_run is not None:
+                wandb_run.config.update({
+                    "manual_compound_features": True,
+                    "manual_compound_valid_smiles": valid_count,
+                    "manual_compound_invalid_smiles": invalid_count,
+                })
 
-    label_counts = df["label"].value_counts().to_dict()
-    for key, value in label_counts.items():
-        print(f"dataset/label_{key}={int(value)}")
+    use_precomputed_embeddings = False
 
-    # _plot_length_distributions(
-    #     df, os.path.dirname(args.data_csv) or ".", wandb_run, wandb_module
-    # )
-    if args.max_samples:
-        print(
-            f"sampling {args.max_samples} rows from {len(df)} total rows, seed={args.seed}")
-        df = df.sample(n=min(args.max_samples, len(df)),
-                       random_state=args.seed)
+    if use_cached_embeddings_from_disk:
+        print(f"Using cached embeddings from disk: {args.cached_embeddings_dir}")
+        use_precomputed_embeddings = True
+    elif args.tuning_mode == "head":
+        print("tuning_mode=head: Pre-computing embeddings in memory...")
 
-    # Shuffle the dataset before train/test split
-    print(f"shuffling dataset, seed={args.seed}")
-    df = df.sample(frac=1, random_state=args.seed).reset_index(drop=True)
-
-    dataset = PairDataset(df)
-    if len(dataset) < 2:
-        raise RuntimeError("Dataset too small after filtering.")
-    train_len = int(len(dataset) * args.train_split)
-    train_len = max(min(train_len, len(dataset) - 1), 1)
-    test_len = len(dataset) - train_len
-    print(f"train_len={train_len} test_len={test_len}")
-    generator = torch.Generator().manual_seed(args.seed)
-    train_set, test_set = random_split(
-        dataset, [train_len, test_len], generator=generator)
-    if args.manual_protein_features:
-        mean, std, invalid_count, valid_count = _compute_manual_protein_feature_stats(train_set)
-        model.protein_encoder.set_normalization(mean, std)
-        print(
-            "manual_protein_features=enabled "
-            f"normalize=standard valid_sequences={valid_count} "
-            f"invalid_sequences={invalid_count}",
-            flush=True,
+        train_set_precomputed = _precompute_embeddings(
+            model, train_set, device,
+            batch_size=args.batch_size,
+            desc="Pre-computing train embeddings"
         )
-        if wandb_run is not None:
-            wandb_run.config.update({
-                "manual_protein_features": True,
-                "manual_protein_valid_sequences": valid_count,
-                "manual_protein_invalid_sequences": invalid_count,
-            })
-    if args.manual_compound_features:
-        mean, std, invalid_count, valid_count = _compute_manual_compound_feature_stats(train_set)
-        model.compound_encoder.set_normalization(mean, std)
-        print(
-            "manual_compound_features=enabled "
-            f"normalize=standard valid_smiles={valid_count} "
-            f"invalid_smiles={invalid_count}",
-            flush=True,
+
+        test_set_precomputed = _precompute_embeddings(
+            model, test_set, device,
+            batch_size=args.batch_size,
+            desc="Pre-computing test embeddings"
         )
-        if wandb_run is not None:
-            wandb_run.config.update({
-                "manual_compound_features": True,
-                "manual_compound_valid_smiles": valid_count,
-                "manual_compound_invalid_smiles": invalid_count,
-            })
+
+        train_set = train_set_precomputed
+        test_set = test_set_precomputed
+        use_precomputed_embeddings = True
+
+        print(f"Pre-computation complete. Training on {len(train_set)} samples, testing on {len(test_set)} samples.")
+
+    if use_precomputed_embeddings:
+        collate_fn = _collate_precomputed_batch
+    else:
+        collate_fn = _collate_batch
+
     train_loader = DataLoader(
         train_set,
         batch_size=args.batch_size,
         shuffle=True,
-        collate_fn=_collate_batch,
+        collate_fn=collate_fn,
     )
     test_loader = DataLoader(
         test_set,
         batch_size=args.batch_size,
         shuffle=False,
-        collate_fn=_collate_batch,
+        collate_fn=collate_fn,
     )
 
     # Calculate total training steps for scheduler
@@ -1635,9 +1878,11 @@ def main() -> None:
             accumulation_steps=args.gradient_accumulation_steps,
             wandb_run=wandb_run,
             grad_clip=args.grad_clip,
-            scheduler=scheduler)
+            scheduler=scheduler,
+            use_precomputed_embeddings=use_precomputed_embeddings)
         test_loss, test_metrics = evaluate(
-            model, test_loader, device, args.amp)
+            model, test_loader, device, args.amp,
+            use_precomputed_embeddings=use_precomputed_embeddings)
         print('test metrics:', test_metrics)
         metric_parts = [f"{k}={v:.4f}" for k, v in test_metrics.items()]
         print(
@@ -1667,7 +1912,8 @@ def main() -> None:
             wandb_run.log(log_data)
         if args.eval_train:
             train_eval_loss, train_metrics = evaluate(
-                model, train_loader, device, args.amp)
+                model, train_loader, device, args.amp,
+                use_precomputed_embeddings=use_precomputed_embeddings)
             train_parts = [f"{k}={v:.4f}" for k,
                            v in train_metrics.items()]
             print(
