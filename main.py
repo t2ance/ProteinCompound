@@ -2,13 +2,12 @@
 import argparse
 import os
 import sys
-from typing import Callable, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset
 from contextlib import nullcontext
 import wandb
 from tqdm import tqdm
@@ -70,72 +69,13 @@ def _smiles_to_batch(smiles_list: List[str]):
     return Batch.from_data_list(graphs)
 
 
-class PairDataset(Dataset):
-    def __init__(self, df: pd.DataFrame) -> None:
-        df = df.copy()
-        df["rna_sequence"] = df["rna_sequence"].fillna("")
-        df["smiles_sequence"] = df["smiles_sequence"].fillna("")
-        df = df[(df["rna_sequence"] != "") & (df["smiles_sequence"] != "")]
-        self.rna = df["rna_sequence"].astype(str).tolist()
-        self.smiles = df["smiles_sequence"].astype(str).tolist()
-        self.labels = df["label"].astype(float).tolist()
-
-    def __len__(self) -> int:
-        return len(self.labels)
-
-    def __getitem__(self, idx: int):
-        return self.rna[idx], self.smiles[idx], self.labels[idx]
-
-
-class PrecomputedEmbeddingDataset(Dataset):
-    def __init__(self, embeddings_list: List[Tuple]):
-        self.embeddings = embeddings_list
-
-    def __len__(self) -> int:
-        return len(self.embeddings)
-
-    def __getitem__(self, idx: int):
-        return self.embeddings[idx]
-
-
-class CachedEmbeddingDataset(Dataset):
-    def __init__(self, cache_dir: str, indices: Optional[List[int]] = None):
-        self.cache_dir = cache_dir
-        metadata_path = os.path.join(cache_dir, "metadata.pt")
-        if not os.path.exists(metadata_path):
-            raise FileNotFoundError(f"Cache metadata not found: {metadata_path}")
-
-        self.metadata = torch.load(metadata_path)
-        self.num_samples = self.metadata['num_samples']
-
-        if indices is None:
-            self.indices = list(range(self.num_samples))
-        else:
-            self.indices = indices
-
-    def __len__(self) -> int:
-        return len(self.indices)
-
-    def __getitem__(self, idx: int):
-        actual_idx = self.indices[idx]
-        sample_path = os.path.join(self.cache_dir, f"sample_{actual_idx:06d}.pt")
-        sample_data = torch.load(sample_path)
-        return (
-            sample_data['prot_emb'],
-            sample_data['prot_mask'],
-            sample_data['comp_emb'],
-            sample_data['comp_mask'],
-            sample_data['label']
-        )
-
-
-def _collate_batch(batch):
-    rna, smiles, labels = zip(*batch)
-    return list(rna), list(smiles), torch.tensor(labels, dtype=torch.float32)
-
-
-def _collate_precomputed_batch(batch):
-    prot_embs, prot_masks, comp_embs, comp_masks, labels = zip(*batch)
+def _collate_hf_batch(batch):
+    """Collate function for HuggingFace dataset format (list of dicts)."""
+    prot_embs = [torch.tensor(sample['prot_emb'], dtype=torch.float32) for sample in batch]
+    prot_masks = [torch.tensor(sample['prot_mask'], dtype=torch.bool) for sample in batch]
+    comp_embs = [torch.tensor(sample['comp_emb'], dtype=torch.float32) for sample in batch]
+    comp_masks = [torch.tensor(sample['comp_mask'], dtype=torch.bool) for sample in batch]
+    labels = [sample['label'] for sample in batch]
 
     max_prot_len = max(e.size(0) for e in prot_embs)
     max_comp_len = max(e.size(0) for e in comp_embs)
@@ -211,7 +151,7 @@ def train_epoch(
     loss_fn = nn.BCEWithLogitsLoss()
     optimizer.zero_grad(set_to_none=True)
     print('Using precomputed embeddings:', use_precomputed_embeddings)
-    for batch_idx, batch_data in enumerate(loader):
+    for batch_idx, batch_data in tqdm(enumerate(loader), total=len(loader), desc="Training"):
 
         if use_precomputed_embeddings:
             prot_emb, prot_mask, comp_emb, comp_mask, labels = batch_data
@@ -242,25 +182,6 @@ def train_epoch(
         # Log batch loss to wandb
         if wandb_run is not None and batch_idx % 50 == 0:
             wandb_run.log({"train/batch_loss": loss.item()})
-
-        # Memory monitoring (log every 10 batches or when debugging)
-        if (batch_idx % 50 == 0 or debug) and device.type == "cuda":
-            mem_allocated = torch.cuda.memory_allocated(device) / 1024**3
-            mem_reserved = torch.cuda.memory_reserved(device) / 1024**3
-            mem_free = (torch.cuda.get_device_properties(device).total_memory
-                        - torch.cuda.memory_allocated(device)) / 1024**3
-            print(f"batch={batch_idx} "
-                  f"loss={loss.item():.4f} "
-                  f"mem_allocated={mem_allocated:.2f}GB "
-                  f"mem_reserved={mem_reserved:.2f}GB "
-                  f"mem_free={mem_free:.2f}GB", flush=True)
-
-            # Peak memory tracking
-            if batch_idx == 0:
-                torch.cuda.reset_peak_memory_stats(device)
-
-            mem_peak = torch.cuda.max_memory_allocated(device) / 1024**3
-            print(f"mem_peak_so_far={mem_peak:.2f}GB", flush=True)
 
         # Optional debug logging for first batch (disabled by default)
         if debug and batch_idx == 0:
@@ -331,13 +252,6 @@ def train_epoch(
                     log_data["train/grad_clipped"] = 1.0 if grad_norm_unclipped > grad_clip else 0.0
                 wandb_run.log(log_data)
 
-            # Print gradient norm periodically
-            if batch_idx % 10 == 0:
-                if grad_clip is not None:
-                    print(f"batch={batch_idx} grad_norm={grad_norm_unclipped:.4f} (clipped={grad_norm_clipped:.4f})", flush=True)
-                else:
-                    print(f"batch={batch_idx} grad_norm={grad_norm_unclipped:.4f}", flush=True)
-
             # Optimizer step
             if scaler is not None:
                 scaler.step(optimizer)
@@ -354,10 +268,6 @@ def train_epoch(
                 wandb_run.log({"train/learning_rate": optimizer.param_groups[0]['lr']})
 
             optimizer.zero_grad(set_to_none=True)
-
-            # Clear CUDA cache after optimizer step to prevent fragmentation
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
 
     return total_loss / max(len(loader.dataset), 1)
 
@@ -945,45 +855,6 @@ def _amp_context(device: torch.device, amp_mode: str):
     return torch.cuda.amp.autocast(dtype=dtype)
 
 
-def _precompute_embeddings(
-    model,
-    dataset: Dataset,
-    device: torch.device,
-    batch_size: int = 8,
-    desc: str = "Pre-computing embeddings"
-) -> PrecomputedEmbeddingDataset:
-    model.eval()
-    embeddings_list = []
-
-    temp_loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=_collate_batch
-    )
-
-    with torch.no_grad():
-        for rna_seqs, smiles_list, labels in tqdm(temp_loader, desc=desc):
-            prot_tokens, prot_pad = model.protein_encoder(rna_seqs, device)
-            comp_tokens, comp_pad = model.compound_encoder(smiles_list, device)
-
-            batch_size_actual = len(rna_seqs)
-            for i in range(batch_size_actual):
-                prot_len = (~prot_pad[i]).sum().item()
-                comp_len = (~comp_pad[i]).sum().item()
-
-                embeddings_list.append((
-                    prot_tokens[i, :prot_len].cpu(),
-                    prot_pad[i, :prot_len].cpu(),
-                    comp_tokens[i, :comp_len].cpu(),
-                    comp_pad[i, :comp_len].cpu(),
-                    labels[i].item()
-                ))
-
-    print(f"Pre-computed {len(embeddings_list)} samples")
-    return PrecomputedEmbeddingDataset(embeddings_list)
-
-
 class ProteinCompoundClassifier(nn.Module):
     def __init__(
         self,
@@ -1104,10 +975,10 @@ class ProteinCompoundClassifier(nn.Module):
         device: torch.device,
         debug: bool = False
     ) -> torch.Tensor:
-        prot_tokens = prot_tokens.to(device)
-        prot_pad = prot_pad.to(device)
-        comp_tokens = comp_tokens.to(device)
-        comp_pad = comp_pad.to(device)
+        prot_tokens = prot_tokens.to(device, non_blocking=True)
+        prot_pad = prot_pad.to(device, non_blocking=True)
+        comp_tokens = comp_tokens.to(device, non_blocking=True)
+        comp_pad = comp_pad.to(device, non_blocking=True)
 
         prot_tokens = self.proj_protein(prot_tokens)
         comp_tokens = self.proj_compound(comp_tokens)
@@ -1221,106 +1092,31 @@ def configure_tuning(
             )
 
 
-def load_and_prepare_dataset(
-    data_csv: str,
-    max_rna_length: int,
-    max_samples: Optional[int],
-    seed: int,
-    wandb_run=None,
-) -> pd.DataFrame:
-    """
-    Load dataset from CSV, filter invalid samples, and prepare for training.
-
-    Returns:
-        Filtered and shuffled DataFrame
-    """
-    df = pd.read_csv(data_csv)
-    df["rna_sequence"] = df["rna_sequence"].fillna("")
-    df["smiles_sequence"] = df["smiles_sequence"].fillna("")
-
-    # Log initial statistics
-    empty_rna = (df["rna_sequence"] == "").sum()
-    empty_smiles = (df["smiles_sequence"] == "").sum()
-    empty_any = ((df["rna_sequence"] == "") | (df["smiles_sequence"] == "")).sum()
-
-    print(
-        f"dataset_rows={len(df)} empty_rna={int(empty_rna)} "
-        f"empty_smiles={int(empty_smiles)} empty_any={int(empty_any)}"
-    )
-    print(
-        f"dataset/rows={len(df)} "
-        f"dataset/empty_rna={int(empty_rna)} "
-        f"dataset/empty_smiles={int(empty_smiles)} "
-        f"dataset/empty_any={int(empty_any)}"
-    )
-
-    # Filter out empty sequences
-    df = df[(df["rna_sequence"] != "") & (df["smiles_sequence"] != "")]
-    print(f"filtered_rows={len(df)}")
-    print(f"dataset/filtered_rows={len(df)}")
-
-    # Filter by RNA sequence length
-    rna_lengths = df["rna_sequence"].astype(str).str.len()
-    too_long = (rna_lengths > max_rna_length).sum()
-    print(f"max_rna_length={max_rna_length}")
-
-    if too_long > 0:
-        print(f"Discarding {int(too_long)} samples with RNA length > {max_rna_length}")
-        df = df[rna_lengths <= max_rna_length]
-        print(f"dataset/discarded_long_rna={int(too_long)}")
-        print(f"dataset/after_length_filter={len(df)}")
-    else:
-        print(f"All samples within max_rna_length={max_rna_length}")
-
-    # Log to WandB if enabled
-    if wandb_run is not None:
-        wandb_run.config.update({
-            "max_rna_length": max_rna_length,
-            "discarded_long_rna": int(too_long),
-            "samples_after_length_filter": len(df),
-        })
-
-    # Log label distribution
-    label_counts = df["label"].value_counts().to_dict()
-    for key, value in label_counts.items():
-        print(f"dataset/label_{key}={int(value)}")
-
-    # Sample if requested
-    if max_samples:
-        print(f"sampling {max_samples} rows from {len(df)} total rows, seed={seed}")
-        df = df.sample(n=min(max_samples, len(df)), random_state=seed)
-
-    # Shuffle the dataset
-    print(f"shuffling dataset, seed={seed}")
-    df = df.sample(frac=1, random_state=seed).reset_index(drop=True)
-
-    return df
-
-
-def load_cached_datasets(
-    cached_embeddings_dir: str,
+def load_hf_datasets(
+    hf_dataset_path: str,
     train_split: float,
     seed: int,
+    max_train_samples: Optional[int] = None,
+    max_val_samples: Optional[int] = None,
 ) -> Tuple[Dataset, Dataset]:
     """
-    Load datasets from cached embeddings directory.
+    Load datasets from HuggingFace dataset directory using best practices.
 
     Returns:
-        train_set, test_set
+        train_set, test_set (HuggingFace Dataset instances)
     """
-    print(f"Loading cached embeddings from {cached_embeddings_dir}")
-    if not os.path.exists(cached_embeddings_dir):
-        raise FileNotFoundError(f"Cached embeddings directory not found: {cached_embeddings_dir}")
+    print(f"Using HuggingFace dataset: {hf_dataset_path}")
+    if not os.path.exists(hf_dataset_path):
+        raise FileNotFoundError(f"HuggingFace dataset not found: {hf_dataset_path}")
 
-    cache_metadata_path = os.path.join(cached_embeddings_dir, "metadata.pt")
-    cache_metadata = torch.load(cache_metadata_path)
-    num_cached_samples = cache_metadata['num_samples']
-    print(f"Found {num_cached_samples} cached samples")
-
-    # Split indices for cached embeddings
-    all_indices = list(range(num_cached_samples))
-    torch.manual_seed(seed)
+    from datasets import load_from_disk
     import random
+
+    full_dataset = load_from_disk(hf_dataset_path)
+    num_cached_samples = len(full_dataset)
+    print(f"Found {num_cached_samples} cached samples in HF dataset")
+
+    all_indices = list(range(num_cached_samples))
     random.seed(seed)
     random.shuffle(all_indices)
 
@@ -1331,148 +1127,20 @@ def load_cached_datasets(
     train_indices = all_indices[:train_len]
     test_indices = all_indices[train_len:]
 
-    print(f"train_len={train_len} test_len={test_len}")
+    if max_train_samples is not None:
+        train_indices = train_indices[:max_train_samples]
+        print(f"Limiting training samples to {len(train_indices)} (max_train_samples={max_train_samples})", flush=True)
 
-    train_set = CachedEmbeddingDataset(cached_embeddings_dir, train_indices)
-    test_set = CachedEmbeddingDataset(cached_embeddings_dir, test_indices)
+    if max_val_samples is not None:
+        test_indices = test_indices[:max_val_samples]
+        print(f"Limiting validation samples to {len(test_indices)} (max_val_samples={max_val_samples})", flush=True)
 
-    return train_set, test_set
+    print(f"train_len={len(train_indices)} test_len={len(test_indices)}")
 
-
-def load_csv_datasets(
-    model: ProteinCompoundClassifier,
-    data_csv: str,
-    max_rna_length: int,
-    max_samples: Optional[int],
-    train_split: float,
-    seed: int,
-    use_manual_protein: bool,
-    use_manual_compound: bool,
-    wandb_run=None,
-) -> Tuple[Dataset, Dataset]:
-    """
-    Load datasets from CSV file, including normalization setup.
-
-    Returns:
-        train_set, test_set
-    """
-    df = load_and_prepare_dataset(
-        data_csv=data_csv,
-        max_rna_length=max_rna_length,
-        max_samples=max_samples,
-        seed=seed,
-        wandb_run=wandb_run,
-    )
-
-    # Create dataset
-    dataset = PairDataset(df)
-    if len(dataset) < 2:
-        raise RuntimeError("Dataset too small after filtering.")
-
-    # Split dataset
-    train_len = int(len(dataset) * train_split)
-    train_len = max(min(train_len, len(dataset) - 1), 1)
-    test_len = len(dataset) - train_len
-
-    print(f"train_len={train_len} test_len={test_len}")
-
-    generator = torch.Generator().manual_seed(seed)
-    train_set, test_set = random_split(
-        dataset, [train_len, test_len], generator=generator
-    )
-
-    # Setup manual feature normalization
-    if use_manual_protein:
-        features = []
-        invalid_count = 0
-        for sequence, _, _ in train_set:
-            feats = main_ml.extract_protein_features(sequence)
-            if not np.isclose(feats.sum(), 0.0):
-                features.append(feats)
-            else:
-                invalid_count += 1
-        if features:
-            feats_np = np.stack(features, axis=0).astype(np.float32)
-            mean, std = feats_np.mean(axis=0), feats_np.std(axis=0)
-            std[std == 0] = 1.0
-            model.protein_encoder.set_normalization(torch.from_numpy(mean), torch.from_numpy(std))
-            print(f"manual_protein_features=enabled normalize=standard valid_sequences={len(features)} invalid_sequences={invalid_count}", flush=True)
-            if wandb_run is not None:
-                wandb_run.config.update({"manual_protein_features": True, "manual_protein_valid_sequences": len(features), "manual_protein_invalid_sequences": invalid_count})
-        else:
-            print("WARNING: no valid protein sequences for manual normalization; using zeros/ones.", file=sys.stderr)
-
-    if use_manual_compound:
-        features = []
-        invalid_count = 0
-        for _, smiles, _ in train_set:
-            feats = main_ml.extract_compound_features(smiles)
-            if feats is not None:
-                features.append(feats)
-            else:
-                invalid_count += 1
-        if features:
-            feats_np = np.stack(features, axis=0).astype(np.float32)
-            mean, std = feats_np.mean(axis=0), feats_np.std(axis=0)
-            std[std == 0] = 1.0
-            model.compound_encoder.set_normalization(torch.from_numpy(mean), torch.from_numpy(std))
-            print(f"manual_compound_features=enabled normalize=standard valid_smiles={len(features)} invalid_smiles={invalid_count}", flush=True)
-            if wandb_run is not None:
-                wandb_run.config.update({"manual_compound_features": True, "manual_compound_valid_smiles": len(features), "manual_compound_invalid_smiles": invalid_count})
-        else:
-            print("WARNING: no valid SMILES for manual compound normalization; using zeros/ones.", file=sys.stderr)
+    train_set = full_dataset.select(train_indices)
+    test_set = full_dataset.select(test_indices)
 
     return train_set, test_set
-
-
-def setup_embeddings_and_collate(
-    model: ProteinCompoundClassifier,
-    train_set: Dataset,
-    test_set: Dataset,
-    device: torch.device,
-    tuning_mode: str,
-    batch_size: int,
-    use_cached_from_disk: bool,
-    cached_embeddings_dir: Optional[str] = None,
-) -> Tuple[Dataset, Dataset, Callable, bool]:
-    """
-    Setup embedding precomputation strategy and appropriate collate function.
-
-    Returns:
-        train_set (potentially replaced with precomputed),
-        test_set (potentially replaced with precomputed),
-        collate_fn,
-        use_precomputed_embeddings (bool)
-    """
-    use_precomputed_embeddings = False
-
-    if use_cached_from_disk:
-        print(f"Using cached embeddings from disk: {cached_embeddings_dir}")
-        use_precomputed_embeddings = True
-        collate_fn = _collate_precomputed_batch
-    elif tuning_mode == "head":
-        print("tuning_mode=head: Pre-computing embeddings in memory...")
-
-        train_set = _precompute_embeddings(
-            model, train_set, device,
-            batch_size=batch_size,
-            desc="Pre-computing train embeddings"
-        )
-
-        test_set = _precompute_embeddings(
-            model, test_set, device,
-            batch_size=batch_size,
-            desc="Pre-computing test embeddings"
-        )
-
-        use_precomputed_embeddings = True
-        collate_fn = _collate_precomputed_batch
-
-        print(f"Pre-computation complete. Training on {len(train_set)} samples, testing on {len(test_set)} samples.")
-    else:
-        collate_fn = _collate_batch
-
-    return train_set, test_set, collate_fn, use_precomputed_embeddings
 
 
 def main() -> None:
@@ -1488,16 +1156,6 @@ def main() -> None:
             "DRUGCHAT_GNN_CKPT",
             "external/drugchat/ckpt/gin_contextpred.pth",
         ),
-    )
-    parser.add_argument(
-        "--manual-protein-features",
-        action="store_true",
-        help="Use amino-acid composition features instead of ESM for proteins.",
-    )
-    parser.add_argument(
-        "--manual-compound-features",
-        action="store_true",
-        help="Use RDKit descriptor features instead of DrugChat GNN for compounds.",
     )
     parser.add_argument(
         "--esm-root",
@@ -1534,11 +1192,6 @@ def main() -> None:
     )
     parser.add_argument(
         "--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument(
-        "--data-csv",
-        default="datasets/sampled.csv",
-        help="CSV with rna_sequence, smiles_sequence, label columns.",
-    )
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument(
@@ -1564,10 +1217,16 @@ def main() -> None:
     )
     parser.add_argument("--wandb-tags", default="")
     parser.add_argument(
-        "--max-samples",
+        "--max-train-samples",
         type=int,
         default=None,
-        help="Limit total samples for quick experiments.",
+        help="Limit training samples (default: None, no limit).",
+    )
+    parser.add_argument(
+        "--max-val-samples",
+        type=int,
+        default=1000,
+        help="Limit validation samples (default: 1000).",
     )
     parser.add_argument(
         "--amp",
@@ -1590,12 +1249,6 @@ def main() -> None:
         type=int,
         default=1,
         help="Number of batches to accumulate gradients before optimizer step.",
-    )
-    parser.add_argument(
-        "--max-rna-length",
-        type=int,
-        default=4096,
-        help="Maximum RNA sequence length. Samples with longer sequences will be discarded.",
     )
     parser.add_argument(
         "--grad-clip",
@@ -1622,19 +1275,32 @@ def main() -> None:
         help="Fusion mode for combining protein and compound representations. 'concat': simple concatenation + MLP, 'xattn': cross-attention (original).",
     )
     parser.add_argument(
-        "--cached-embeddings-dir",
-        default=None,
-        help="Directory containing cached embeddings (from extract_embeddings.py). If set, skips encoder initialization and loads pre-computed embeddings from disk.",
+        "--hf-dataset",
+        required=True,
+        help="Path to HuggingFace dataset directory (created by convert_to_hf_dataset.py).",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=4,
+        help="Number of worker processes for data loading. 0 means main process only (slow). Higher values improve GPU utilization.",
+    )
+    parser.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=4,
+        help="Number of batches to prefetch per worker (only used if num_workers > 0).",
     )
     args = parser.parse_args()
     if args.gradient_accumulation_steps < 1:
         raise ValueError("gradient_accumulation_steps must be >= 1")
+
+    print(f"Dataset limits: max_train_samples={args.max_train_samples if args.max_train_samples is not None else 'None (no limit)'}, max_val_samples={args.max_val_samples}", flush=True)
+
     wandb_run = None
     wandb_module = None
     if args.wandb:
         wandb_run, wandb_module = _init_wandb(args)
-
-    use_cached_embeddings_from_disk = args.cached_embeddings_dir is not None
 
     model = build_model(
         drugchat_root=args.drugchat_root,
@@ -1647,44 +1313,23 @@ def main() -> None:
         mlp_hidden=args.mlp_hidden,
         tuning_mode=args.tuning_mode,
         fusion_mode=args.fusion_mode,
-        manual_compound_features=args.manual_compound_features,
-        manual_protein_features=args.manual_protein_features,
+        manual_compound_features=False,
+        manual_protein_features=False,
     )
-    if args.manual_protein_features:
-        print(
-            "protein_encoder=manual "
-            f"features={len(main_ml.AMINO_ACIDS)} normalize=standard",
-            flush=True,
-        )
-    else:
-        print(
-            "protein_encoder=esm "
-            f"model={args.esm_model} checkpoint={args.esm_checkpoint}",
-            flush=True,
-        )
-    if args.manual_compound_features:
-        print(
-            "compound_encoder=manual "
-            f"descriptors={','.join(main_ml.COMPOUND_DESCRIPTORS)} "
-            "normalize=standard",
-            flush=True,
-        )
-    else:
-        print(
-            f"compound_encoder=drugchat gnn_checkpoint={args.gnn_checkpoint}",
-            flush=True,
-        )
+    print(
+        "protein_encoder=esm "
+        f"model={args.esm_model} checkpoint={args.esm_checkpoint} (encoders not used, embeddings precomputed)",
+        flush=True,
+    )
+    print(
+        f"compound_encoder=drugchat gnn_checkpoint={args.gnn_checkpoint} (encoders not used, embeddings precomputed)",
+        flush=True,
+    )
     print(f"fusion_mode={args.fusion_mode}", flush=True)
     if args.flash_attn:
-        if args.manual_protein_features:
-            print("flash_attn=skipped manual_protein_features=True", flush=True)
-        else:
-            _apply_sdpa_to_esm(model.protein_encoder.model)
+        _apply_sdpa_to_esm(model.protein_encoder.model)
     if args.grad_checkpoint:
-        if args.manual_protein_features:
-            print("grad_checkpoint=skipped manual_protein_features=True", flush=True)
-        else:
-            _enable_gradient_checkpointing_esm(model.protein_encoder.model)
+        _enable_gradient_checkpointing_esm(model.protein_encoder.model)
         model.compound_encoder.enable_gradient_checkpointing()
         _enable_gradient_checkpointing_cross_attn(model)
     configure_tuning(
@@ -1715,53 +1360,48 @@ def main() -> None:
 
     torch.manual_seed(args.seed)
 
-    # Load datasets (either from cache or CSV)
-    if use_cached_embeddings_from_disk:
-        train_set, test_set = load_cached_datasets(
-            cached_embeddings_dir=args.cached_embeddings_dir,
-            train_split=args.train_split,
-            seed=args.seed,
-        )
-    else:
-        train_set, test_set = load_csv_datasets(
-            model=model,
-            data_csv=args.data_csv,
-            max_rna_length=args.max_rna_length,
-            max_samples=args.max_samples,
-            train_split=args.train_split,
-            seed=args.seed,
-            use_manual_protein=args.manual_protein_features,
-            use_manual_compound=args.manual_compound_features,
-            wandb_run=wandb_run,
-        )
-
-    # Setup embeddings and collate function
-    train_set, test_set, collate_fn, use_precomputed_embeddings = setup_embeddings_and_collate(
-        model=model,
-        train_set=train_set,
-        test_set=test_set,
-        device=device,
-        tuning_mode=args.tuning_mode,
-        batch_size=args.batch_size,
-        use_cached_from_disk=use_cached_embeddings_from_disk,
-        cached_embeddings_dir=args.cached_embeddings_dir,
+    # Load HuggingFace datasets
+    train_set, test_set = load_hf_datasets(
+        hf_dataset_path=args.hf_dataset,
+        train_split=args.train_split,
+        seed=args.seed,
+        max_train_samples=args.max_train_samples,
+        max_val_samples=args.max_val_samples,
     )
+
+    # Use HuggingFace collate function (precomputed embeddings)
+    collate_fn = _collate_hf_batch
+    use_precomputed_embeddings = True
 
     train_loader = DataLoader(
         train_set,
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=collate_fn,
+        num_workers=args.num_workers,
+        pin_memory=True if device.type == "cuda" else False,
+        persistent_workers=True if args.num_workers > 0 else False,
+        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
     )
     test_loader = DataLoader(
         test_set,
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=collate_fn,
+        num_workers=args.num_workers,
+        pin_memory=True if device.type == "cuda" else False,
+        persistent_workers=True if args.num_workers > 0 else False,
+        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
     )
+
+    print(f"dataloader/num_workers={args.num_workers} "
+          f"dataloader/prefetch_factor={args.prefetch_factor if args.num_workers > 0 else 'N/A'} "
+          f"dataloader/pin_memory={True if device.type == 'cuda' else False} "
+          f"dataloader/persistent_workers={True if args.num_workers > 0 else False}", flush=True)
 
     # Calculate total training steps for scheduler
     num_batches_per_epoch = len(train_loader)
+
     steps_per_epoch = (num_batches_per_epoch + args.gradient_accumulation_steps - 1) // args.gradient_accumulation_steps
     total_training_steps = steps_per_epoch * args.epochs
     print(f"scheduler/num_batches_per_epoch={num_batches_per_epoch} "
