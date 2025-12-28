@@ -2,6 +2,11 @@
 import argparse
 import os
 import sys
+
+sys.path.insert(0, os.path.abspath("external/esm"))
+sys.path.insert(0, os.path.abspath("external/drugchat/dataset"))
+sys.path.insert(0, os.path.abspath("external/drugchat"))
+
 import random
 from typing import List, Optional, Tuple
 
@@ -75,10 +80,10 @@ def smiles_to_batch(smiles_list: List[str]):
 
 def collate_hf_batch(batch):
     """Collate function for HuggingFace dataset format (list of dicts)."""
-    prot_embs = [torch.tensor(sample['prot_emb'], dtype=torch.float32) for sample in batch]
-    prot_masks = [torch.tensor(sample['prot_mask'], dtype=torch.bool) for sample in batch]
-    comp_embs = [torch.tensor(sample['comp_emb'], dtype=torch.float32) for sample in batch]
-    comp_masks = [torch.tensor(sample['comp_mask'], dtype=torch.bool) for sample in batch]
+    prot_embs = [sample['prot_emb'] for sample in batch]
+    prot_masks = [sample['prot_mask'] for sample in batch]
+    comp_embs = [sample['comp_emb'] for sample in batch]
+    comp_masks = [sample['comp_mask'] for sample in batch]
     labels = [sample['label'] for sample in batch]
 
     max_prot_len = max(e.size(0) for e in prot_embs)
@@ -102,7 +107,7 @@ def collate_hf_batch(batch):
         padded_comp[i, :comp_len] = comp_emb
         padded_comp_mask[i, :comp_len] = comp_mask
 
-    labels_tensor = torch.tensor(labels, dtype=torch.float32)
+    labels_tensor = torch.stack(labels)
 
     return padded_prot, padded_prot_mask, padded_comp, padded_comp_mask, labels_tensor
 
@@ -1128,6 +1133,16 @@ def load_hf_datasets(
     train_set = full_dataset.select(train_indices)
     test_set = full_dataset.select(test_indices)
 
+    # Convert HF dataset to return PyTorch tensors (not lists)
+    train_set.set_format(
+        type='torch',
+        columns=['prot_emb', 'prot_mask', 'comp_emb', 'comp_mask', 'label']
+    )
+    test_set.set_format(
+        type='torch',
+        columns=['prot_emb', 'prot_mask', 'comp_emb', 'comp_mask', 'label']
+    )
+
     return train_set, test_set
 
 
@@ -1201,7 +1216,7 @@ def main() -> None:
     parser.add_argument(
         "--log-steps",
         type=int,
-        default=50,
+        default=10,
         help="Log training metrics (batch loss, grad norms, LR) to wandb every N steps."
     )
     parser.add_argument(
@@ -1210,7 +1225,6 @@ def main() -> None:
         default=None,
         help="Run validation every N steps. If None, defaults to num_steps // 10 (10%% of training)."
     )
-    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging.")
     parser.add_argument("--wandb-project", default="protein-compound")
     parser.add_argument("--wandb-entity", default=None)
     parser.add_argument("--wandb-run-name", default=None)
@@ -1292,13 +1306,13 @@ def main() -> None:
     parser.add_argument(
         "--num-workers",
         type=int,
-        default=4,
+        default=16,
         help="Number of worker processes for data loading. 0 means main process only (slow). Higher values improve GPU utilization.",
     )
     parser.add_argument(
         "--prefetch-factor",
         type=int,
-        default=4,
+        default=8,
         help="Number of batches to prefetch per worker (only used if num_workers > 0).",
     )
     args = parser.parse_args()
@@ -1307,10 +1321,8 @@ def main() -> None:
 
     print(f"Dataset limits: max_train_samples={args.max_train_samples if args.max_train_samples is not None else 'None (no limit)'}, max_val_samples={args.max_val_samples}", flush=True)
 
-    wandb_run = None
-    if args.wandb:
-        tags = parse_list(args.wandb_tags)
-        wandb_run = wandb.init(
+    tags = parse_list(args.wandb_tags)
+    wandb.init(
             project=args.wandb_project,
             entity=args.wandb_entity,
             name=args.wandb_run_name,
@@ -1466,14 +1478,6 @@ def main() -> None:
         f"model/trainable_pct={100.0 * trainable_params / total_params:.2f}%"
     )
 
-    # Log gradient clipping configuration
-    if args.grad_clip is not None:
-        print(f"gradient_clipping=enabled max_norm={args.grad_clip}", flush=True)
-        if wandb_run is not None:
-            wandb_run.config.update({"grad_clip": args.grad_clip})
-    else:
-        print("gradient_clipping=disabled", flush=True)
-
     # Create learning rate scheduler
     scheduler = None
     if args.scheduler_type == "linear_warmup_cosine":
@@ -1497,17 +1501,6 @@ def main() -> None:
         )
     else:
         print("scheduler/type=none", flush=True)
-
-    if wandb_run is not None:
-        config_update = {
-            "optimizer": args.optimizer,
-            "scheduler_type": args.scheduler_type,
-            "warmup_ratio": args.warmup_ratio,
-            "total_training_steps": total_training_steps,
-        }
-        if args.optimizer == "sgd":
-            config_update["momentum"] = args.momentum
-        wandb_run.config.update(config_update)
 
     # Step-based training loop
     global_step = 0
@@ -1563,7 +1556,7 @@ def main() -> None:
             pbar.update(1)
 
             # Logging every log_steps
-            if wandb_run is not None and global_step % args.log_steps == 0:
+            if global_step % args.log_steps == 0:
                 log_data = {
                     "step": global_step,
                     "train/batch_loss": loss,
@@ -1572,7 +1565,7 @@ def main() -> None:
                 # Add gradient norm if available (only on accumulation boundaries)
                 if grad_norm is not None:
                     log_data["train/grad_norm"] = grad_norm
-                wandb_run.log(log_data)
+                wandb.log(log_data)
 
             # Validation every eval_steps
             if global_step % eval_steps == 0:
@@ -1584,44 +1577,24 @@ def main() -> None:
                 metric_parts = [f"{k}={v:.4f}" for k, v in val_metrics.items()]
                 print(f"\nstep={global_step} val_loss={val_loss:.4f} {' '.join(metric_parts)}")
 
-                if wandb_run is not None:
-                    log_data = {
-                        "step": global_step,
-                        "val/loss": val_loss,
-                    }
-                    for key, value in val_metrics.items():
-                        log_data[f"val/{key}"] = value
+                log_data = {
+                    "step": global_step,
+                    "val/loss": val_loss,
+                }
+                for key, value in val_metrics.items():
+                    log_data[f"val/{key}"] = value
 
-                    # Add memory metrics
-                    if device.type == "cuda":
-                        log_data["memory/allocated_gb"] = torch.cuda.memory_allocated(device) / 1024**3
-                        log_data["memory/reserved_gb"] = torch.cuda.memory_reserved(device) / 1024**3
-                    wandb_run.log(log_data)
+                # Add memory metrics
+                if device.type == "cuda":
+                    log_data["memory/allocated_gb"] = torch.cuda.memory_allocated(device) / 1024**3
+                    log_data["memory/reserved_gb"] = torch.cuda.memory_reserved(device) / 1024**3
+                wandb.log(log_data)
 
                 model.train()  # Switch back to training mode
 
     pbar.close()
 
-    # Final validation at end
-    print("\nRunning final validation...")
-    val_loss, val_metrics = evaluate(
-        model, test_loader, device, args.amp,
-        use_precomputed_embeddings=use_precomputed_embeddings
-    )
-    metric_parts = [f"{k}={v:.4f}" for k, v in val_metrics.items()]
-    print(f"final_step={global_step} val_loss={val_loss:.4f} {' '.join(metric_parts)}")
-
-    if wandb_run is not None:
-        log_data = {
-            "step": global_step,
-            "val/loss": val_loss,
-        }
-        for key, value in val_metrics.items():
-            log_data[f"val/{key}"] = value
-        wandb_run.log(log_data)
-
-    if wandb_run is not None:
-        wandb_run.finish()
+    wandb.finish()
 
 
 if __name__ == "__main__":
