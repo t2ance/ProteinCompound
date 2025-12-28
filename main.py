@@ -2,6 +2,7 @@
 import argparse
 import os
 import sys
+import random
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -11,9 +12,17 @@ from torch.utils.data import DataLoader, Dataset
 from contextlib import nullcontext
 import wandb
 from tqdm import tqdm
+import esm
+from esm import multihead_attention as esm_mha
+from torch_geometric.data import Data, Batch
+from dataset.smiles2graph import smiles2graph
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from pipeline.models.gnn import GNN_graphpred
+from peft import inject_adapter_in_model, LoraConfig
+from datasets import load_from_disk
 
 import main_ml
-def _ensure_repo_path(repo_root: str, label: str) -> None:
+def ensure_repo_path(repo_root: str, label: str) -> None:
     if not repo_root:
         raise ValueError(f"{label} is required.")
     if not os.path.isdir(repo_root):
@@ -22,13 +31,12 @@ def _ensure_repo_path(repo_root: str, label: str) -> None:
         sys.path.insert(0, repo_root)
 
 
-def _load_esm(
+def load_esm(
     esm_root: str,
     model_name: str,
     checkpoint_path: Optional[str],
 ) -> Tuple[object, object]:
-    _ensure_repo_path(esm_root, "esm_root")
-    import esm
+    ensure_repo_path(esm_root, "esm_root")
     if checkpoint_path:
         print(f"loading_esm_checkpoint={checkpoint_path}", flush=True)
         if not os.path.isfile(checkpoint_path):
@@ -51,10 +59,7 @@ def _load_esm(
     return model, alphabet
 
 
-def _smiles_to_graph(smiles: str):
-    from torch_geometric.data import Data
-    from dataset.smiles2graph import smiles2graph
-
+def smiles_to_graph(smiles: str):
     graph = smiles2graph(smiles)
     return Data(
         x=torch.as_tensor(graph["node_feat"]),
@@ -63,13 +68,12 @@ def _smiles_to_graph(smiles: str):
     )
 
 
-def _smiles_to_batch(smiles_list: List[str]):
-    from torch_geometric.data import Batch
-    graphs = [_smiles_to_graph(smiles) for smiles in smiles_list]
+def smiles_to_batch(smiles_list: List[str]):
+    graphs = [smiles_to_graph(smiles) for smiles in smiles_list]
     return Batch.from_data_list(graphs)
 
 
-def _collate_hf_batch(batch):
+def collate_hf_batch(batch):
     """Collate function for HuggingFace dataset format (list of dicts)."""
     prot_embs = [torch.tensor(sample['prot_emb'], dtype=torch.float32) for sample in batch]
     prot_masks = [torch.tensor(sample['prot_mask'], dtype=torch.bool) for sample in batch]
@@ -103,173 +107,99 @@ def _collate_hf_batch(batch):
     return padded_prot, padded_prot_mask, padded_comp, padded_comp_mask, labels_tensor
 
 
-def _binary_metrics(preds: torch.Tensor, labels: torch.Tensor) -> dict:
-    # Convert to float32 to avoid BFloat16 issues with sklearn
-    preds = preds.detach().cpu().float()
-    labels = labels.detach().cpu().float()
-    pred_labels = (preds >= 0.5).to(torch.int64)
-    labels_int = labels.to(torch.int64)
-    tp = int(((pred_labels == 1) & (labels_int == 1)).sum())
-    tn = int(((pred_labels == 0) & (labels_int == 0)).sum())
-    fp = int(((pred_labels == 1) & (labels_int == 0)).sum())
-    fn = int(((pred_labels == 0) & (labels_int == 1)).sum())
-    total = max(tp + tn + fp + fn, 1)
-    accuracy = (tp + tn) / total
-    precision = tp / max(tp + fp, 1)
-    recall = tp / max(tp + fn, 1)
-    f1 = 0.0 if (precision + recall) == 0 else 2 * \
-        precision * recall / (precision + recall)
+def binary_metrics(preds: torch.Tensor, labels: torch.Tensor) -> dict:
+    # Convert to numpy arrays
+    preds_np = preds.detach().cpu().float().numpy()
+    labels_np = labels.detach().cpu().float().numpy()
+    pred_labels_np = (preds_np >= 0.5).astype(int)
+    labels_int_np = labels_np.astype(int)
+
     metrics = {
-        "accuracy": accuracy,
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
+        "accuracy": float(accuracy_score(labels_int_np, pred_labels_np)),
+        "precision": float(precision_score(labels_int_np, pred_labels_np, zero_division=0)),
+        "recall": float(recall_score(labels_int_np, pred_labels_np, zero_division=0)),
+        "f1": float(f1_score(labels_int_np, pred_labels_np, zero_division=0)),
+        "roc_auc": float(roc_auc_score(labels_int_np, preds_np)),
     }
-    from sklearn.metrics import roc_auc_score
-    try:
-        metrics["roc_auc"] = float(roc_auc_score(labels_int.numpy(), preds.numpy()))
-    except ValueError:
-        metrics["roc_auc"] = float("nan")
+
     return metrics
 
-def train_epoch(
+def train_step(
     model: nn.Module,
-    loader: DataLoader,
+    batch_data: Tuple,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     amp_mode: str,
     scaler: Optional[torch.cuda.amp.GradScaler],
-    accumulation_steps: int = 1,
-    debug: bool = False,
-    wandb_run: Optional[wandb.Run] = None,
+    accumulation_steps: int,
+    step_within_accumulation: int,
     grad_clip: Optional[float] = None,
     scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
-    use_precomputed_embeddings: bool = False,
-) -> float:
+    use_precomputed_embeddings: bool = True,
+) -> Tuple[float, Optional[float]]:
     model.train()
-    total_loss = 0.0
     loss_fn = nn.BCEWithLogitsLoss()
-    optimizer.zero_grad(set_to_none=True)
-    print('Using precomputed embeddings:', use_precomputed_embeddings)
-    for batch_idx, batch_data in tqdm(enumerate(loader), total=len(loader), desc="Training"):
 
-        if use_precomputed_embeddings:
-            prot_emb, prot_mask, comp_emb, comp_mask, labels = batch_data
-            labels = labels.to(device)
+    if use_precomputed_embeddings:
+        prot_emb, prot_mask, comp_emb, comp_mask, labels = batch_data
+        labels = labels.to(device)
 
-            with _amp_context(device, amp_mode):
-                logits = model.forward_from_embeddings(
-                    prot_emb, prot_mask, comp_emb, comp_mask, device, debug=False
-                )
-                loss = loss_fn(logits, labels)
-        else:
-            rna, smiles, labels = batch_data
-            labels = labels.to(device)
+        with amp_context(device, amp_mode):
+            logits = model(prot_emb, prot_mask, comp_emb, comp_mask, device)
+            loss = loss_fn(logits, labels)
+    else:
+        rna, smiles, labels = batch_data
+        labels = labels.to(device)
 
-            with _amp_context(device, amp_mode):
-                logits = model(rna, smiles, device=device, debug=False)
-                loss = loss_fn(logits, labels)
+        with amp_context(device, amp_mode):
+            logits = model(rna, smiles, device=device)
+            loss = loss_fn(logits, labels)
 
-        # Scale loss for gradient accumulation (average instead of sum)
-        scaled_loss = loss / accumulation_steps
+    # Scale loss for gradient accumulation
+    scaled_loss = loss / accumulation_steps
 
+    if scaler is not None:
+        scaler.scale(scaled_loss).backward()
+    else:
+        scaled_loss.backward()
+
+    # Only update optimizer every N steps
+    is_accumulation_boundary = (step_within_accumulation == accumulation_steps - 1)
+    grad_norm = None
+
+    if is_accumulation_boundary:
+        # Unscale gradients first if using GradScaler
         if scaler is not None:
-            scaler.scale(scaled_loss).backward()
+            scaler.unscale_(optimizer)
+
+        # Apply gradient clipping if specified and compute norm
+        if grad_clip is not None:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), grad_clip
+            ).item()
         else:
-            scaled_loss.backward()
-        total_loss += loss.item() * labels.size(0)
+            # Compute gradient norm without clipping
+            total_norm = 0.0
+            for p in model.parameters():
+                if p.grad is not None:
+                    param_norm = p.grad.data.norm(2)
+                    total_norm += param_norm.item() ** 2
+            grad_norm = total_norm ** 0.5
 
-        # Log batch loss to wandb
-        if wandb_run is not None and batch_idx % 50 == 0:
-            wandb_run.log({"train/batch_loss": loss.item()})
+        # Optimizer step
+        if scaler is not None:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
 
-        # Optional debug logging for first batch (disabled by default)
-        if debug and batch_idx == 0:
-            print(f"\n{'='*80}")
-            print(f"=== DEBUG BATCH {batch_idx} ===")
-            print(f"{'='*80}")
-            print(f"\n[LOSS] Loss: {loss.item():.6f}")
-            print(f"[LABELS] Shape: {labels.shape}, Min: {labels.min().item():.4f}, Max: {labels.max().item():.4f}, Mean: {labels.mean().item():.4f}")
-            print(f"[LOGITS] Shape: {logits.shape}, Min: {logits.min().item():.4f}, Max: {logits.max().item():.4f}, Mean: {logits.mean().item():.4f}, Std: {logits.std().item():.4f}")
+        # Step the scheduler after each optimizer update
+        if scheduler is not None:
+            scheduler.step()
 
-            # Check gradient flow
-            print(f"\n[GRADIENT FLOW CHECK]")
-            grad_stats = {}
-            for name, param in model.named_parameters():
-                if param.requires_grad and param.grad is not None:
-                    grad_norm = param.grad.norm().item()
-                    module_prefix = name.split('.')[0]
-                    if module_prefix not in grad_stats:
-                        grad_stats[module_prefix] = []
-                    grad_stats[module_prefix].append(grad_norm)
+        optimizer.zero_grad(set_to_none=True)
 
-            for module, norms in grad_stats.items():
-                avg_norm = sum(norms) / len(norms)
-                max_norm = max(norms)
-                print(f"  {module}: avg_grad_norm={avg_norm:.6f}, max_grad_norm={max_norm:.6f}, num_params={len(norms)}")
-
-            if not grad_stats:
-                print("  WARNING: No gradients found!")
-
-        is_last_batch = (batch_idx + 1) == len(loader)
-        should_update = ((batch_idx + 1) % accumulation_steps == 0) or is_last_batch
-        if should_update:
-            # Unscale gradients first if using GradScaler
-            if scaler is not None:
-                scaler.unscale_(optimizer)
-
-            # Apply gradient clipping if specified and compute norms
-            if grad_clip is not None:
-                # clip_grad_norm_ returns the total norm before clipping
-                grad_norm_unclipped = torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), grad_clip
-                ).item()
-
-                # Compute the actual norm after clipping
-                total_norm = 0.0
-                for p in model.parameters():
-                    if p.grad is not None:
-                        param_norm = p.grad.data.norm(2)
-                        total_norm += param_norm.item() ** 2
-                grad_norm_clipped = total_norm ** 0.5
-            else:
-                # Just compute the gradient norm without clipping
-                total_norm = 0.0
-                for p in model.parameters():
-                    if p.grad is not None:
-                        param_norm = p.grad.data.norm(2)
-                        total_norm += param_norm.item() ** 2
-                grad_norm_unclipped = total_norm ** 0.5
-                grad_norm_clipped = grad_norm_unclipped
-
-            # Log gradient norms to wandb
-            if wandb_run is not None:
-                log_data = {
-                    "train/grad_norm_unclipped": grad_norm_unclipped,
-                }
-                if grad_clip is not None:
-                    log_data["train/grad_norm_clipped"] = grad_norm_clipped
-                    log_data["train/grad_clipped"] = 1.0 if grad_norm_unclipped > grad_clip else 0.0
-                wandb_run.log(log_data)
-
-            # Optimizer step
-            if scaler is not None:
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
-
-            # Step the scheduler after each optimizer update
-            if scheduler is not None:
-                scheduler.step()
-
-            # Log learning rate (enabled by default when scheduler is active)
-            if wandb_run is not None and scheduler is not None:
-                wandb_run.log({"train/learning_rate": optimizer.param_groups[0]['lr']})
-
-            optimizer.zero_grad(set_to_none=True)
-
-    return total_loss / max(len(loader.dataset), 1)
+    return loss.item(), grad_norm
 
 
 def evaluate(
@@ -291,16 +221,14 @@ def evaluate(
                 prot_emb, prot_mask, comp_emb, comp_mask, labels = batch_data
                 labels = labels.to(device)
 
-                with _amp_context(device, amp_mode):
-                    logits = model.forward_from_embeddings(
-                        prot_emb, prot_mask, comp_emb, comp_mask, device
-                    )
+                with amp_context(device, amp_mode):
+                    logits = model(prot_emb, prot_mask, comp_emb, comp_mask, device)
                     loss = loss_fn(logits, labels)
             else:
                 rna, smiles, labels = batch_data
                 labels = labels.to(device)
 
-                with _amp_context(device, amp_mode):
+                with amp_context(device, amp_mode):
                     logits = model(rna, smiles, device=device)
                     loss = loss_fn(logits, labels)
             total_loss += loss.item() * labels.size(0)
@@ -310,7 +238,7 @@ def evaluate(
     if all_probs:
         probs = torch.cat(all_probs, dim=0)
         labels = torch.cat(all_labels, dim=0)
-        metrics = _binary_metrics(probs, labels)
+        metrics = binary_metrics(probs, labels)
     else:
         metrics = {}
     return total_loss / max(len(loader.dataset), 1), metrics
@@ -325,7 +253,7 @@ class ProteinEncoderESM(nn.Module):
         freeze: bool = True,
     ):
         super().__init__()
-        self.model, self.alphabet = _load_esm(
+        self.model, self.alphabet = load_esm(
             esm_root, model_name, checkpoint_path)
         print(f"ESM checkpoint loaded from {checkpoint_path}")
         self.batch_converter = self.alphabet.get_batch_converter()
@@ -487,8 +415,7 @@ class DrugChatCompoundEncoder(nn.Module):
         freeze: bool = True,
     ):
         super().__init__()
-        _ensure_repo_path(drugchat_root, "drugchat_root")
-        from pipeline.models.gnn import GNN_graphpred
+        ensure_repo_path(drugchat_root, "drugchat_root")
         self.gnn = GNN_graphpred(
             num_layer,
             emb_dim,
@@ -532,7 +459,7 @@ class DrugChatCompoundEncoder(nn.Module):
         print("grad_checkpointing=enabled_for_gnn", flush=True)
 
     def forward(self, smiles_list: List[str], device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-        batch = _smiles_to_batch(smiles_list).to(device)
+        batch = smiles_to_batch(smiles_list).to(device)
         if self.freeze:
             self.gnn.eval()
 
@@ -575,7 +502,7 @@ class DrugChatCompoundEncoder(nn.Module):
         return padded_feats, padding_mask
 
 
-def _masked_mean(x: torch.Tensor, padding_mask: Optional[torch.Tensor]) -> torch.Tensor:
+def masked_mean(x: torch.Tensor, padding_mask: Optional[torch.Tensor]) -> torch.Tensor:
     if padding_mask is None:
         return x.mean(dim=1)
     keep = (~padding_mask).unsqueeze(-1).float()
@@ -583,18 +510,18 @@ def _masked_mean(x: torch.Tensor, padding_mask: Optional[torch.Tensor]) -> torch
     return (x * keep).sum(dim=1) / denom
 
 
-def _set_requires_grad(module: nn.Module, requires_grad: bool) -> None:
+def set_requires_grad(module: nn.Module, requires_grad: bool) -> None:
     for param in module.parameters():
         param.requires_grad = requires_grad
 
 
-def _parse_list(value: str) -> List[str]:
+def parse_list(value: str) -> List[str]:
     if value is None:
         return []
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
-def _apply_lora(
+def apply_lora(
     module: nn.Module,
     target_modules: List[str],
     r: int,
@@ -604,8 +531,6 @@ def _apply_lora(
 ) -> nn.Module:
     if not target_modules:
         return module
-    from peft import inject_adapter_in_model, LoraConfig
-
     config = LoraConfig(
         r=r,
         lora_alpha=alpha,
@@ -629,12 +554,10 @@ def _apply_lora(
     return module
 
 
-def _apply_sdpa_to_esm(model) -> None:
+def apply_sdpa_to_esm(model) -> None:
     if not hasattr(torch.nn.functional, "scaled_dot_product_attention"):
         print("sdpa_unavailable=no_scaled_dot_product_attention", flush=True)
         return
-
-    from esm import multihead_attention as esm_mha
 
     if getattr(esm_mha, "_sdpa_patched", False):
         return
@@ -753,7 +676,7 @@ def _apply_sdpa_to_esm(model) -> None:
             pass
 
 
-def _enable_gradient_checkpointing_esm(model) -> None:
+def enable_gradient_checkpointing_esm(model) -> None:
     if getattr(model, "_gc_wrapped", False):
         return
     if not hasattr(torch.utils, "checkpoint"):
@@ -794,7 +717,7 @@ def _enable_gradient_checkpointing_esm(model) -> None:
     print("grad_checkpointing=enabled_for_esm", flush=True)
 
 
-def _enable_gradient_checkpointing_cross_attn(model) -> None:
+def enable_gradient_checkpointing_cross_attn(model) -> None:
     """Enable gradient checkpointing for cross-attention module."""
     if getattr(model, "_cross_attn_gc_wrapped", False):
         return
@@ -834,25 +757,82 @@ def _enable_gradient_checkpointing_cross_attn(model) -> None:
     print("grad_checkpointing=enabled_for_cross_attention", flush=True)
 
 
-def _init_wandb(args):
-    import wandb
-    tags = _parse_list(args.wandb_tags)
-    run = wandb.init(
-        project=args.wandb_project,
-        entity=args.wandb_entity,
-        name=args.wandb_run_name,
-        mode=args.wandb_mode,
-        tags=tags if tags else None,
-        config=vars(args),
-    )
-    return run, wandb
-
-
-def _amp_context(device: torch.device, amp_mode: str):
+def amp_context(device: torch.device, amp_mode: str):
     if amp_mode == "off" or device.type != "cuda":
         return nullcontext()
     dtype = torch.float16 if amp_mode == "fp16" else torch.bfloat16
     return torch.cuda.amp.autocast(dtype=dtype)
+
+
+class LightweightProteinCompoundClassifier(nn.Module):
+    """Lightweight classifier for precomputed embeddings (no encoders)."""
+    def __init__(
+        self,
+        prot_emb_dim: int = 1280,
+        comp_emb_dim: int = 300,
+        hidden_dim: int = 512,
+        num_heads: int = 8,
+        mlp_hidden: int = 256,
+        dropout: float = 0.0,
+        fusion_mode: str = "xattn",
+    ):
+        super().__init__()
+        self.fusion_mode = fusion_mode
+        self.prot_emb_dim = prot_emb_dim
+        self.comp_emb_dim = comp_emb_dim
+
+        self.proj_protein = nn.Linear(prot_emb_dim, hidden_dim)
+        self.proj_compound = nn.Linear(comp_emb_dim, hidden_dim)
+
+        if fusion_mode == "xattn":
+            self.cross_attn = nn.MultiheadAttention(
+                hidden_dim, num_heads, batch_first=True)
+            classifier_input_dim = hidden_dim
+        elif fusion_mode == "concat":
+            self.cross_attn = None
+            classifier_input_dim = hidden_dim * 2
+        else:
+            raise ValueError(f"Unknown fusion_mode: {fusion_mode}")
+
+        self.classifier = nn.Sequential(
+            nn.Linear(classifier_input_dim, mlp_hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_hidden, 1),
+        )
+
+    def forward(
+        self,
+        prot_tokens: torch.Tensor,
+        prot_pad: torch.Tensor,
+        comp_tokens: torch.Tensor,
+        comp_pad: torch.Tensor,
+        device: torch.device,
+        debug: bool = False
+    ) -> torch.Tensor:
+        prot_tokens = prot_tokens.to(device, non_blocking=True)
+        prot_pad = prot_pad.to(device, non_blocking=True)
+        comp_tokens = comp_tokens.to(device, non_blocking=True)
+        comp_pad = comp_pad.to(device, non_blocking=True)
+
+        prot_tokens = self.proj_protein(prot_tokens)
+        comp_tokens = self.proj_compound(comp_tokens)
+
+        if self.fusion_mode == "xattn":
+            fused, _ = self.cross_attn(
+                prot_tokens, comp_tokens, comp_tokens,
+                key_padding_mask=comp_pad,
+                need_weights=False,
+                average_attn_weights=True
+            )
+            pooled = masked_mean(fused, prot_pad)
+        elif self.fusion_mode == "concat":
+            pooled_prot = masked_mean(prot_tokens, prot_pad)
+            pooled_comp = masked_mean(comp_tokens, comp_pad)
+            pooled = torch.cat([pooled_prot, pooled_comp], dim=-1)
+
+        logits = self.classifier(pooled).squeeze(-1)
+        return logits
 
 
 class ProteinCompoundClassifier(nn.Module):
@@ -939,12 +919,12 @@ class ProteinCompoundClassifier(nn.Module):
                     print(f"  attention entropy: {entropy.item():.4f} / {max_entropy.item():.4f} (higher=more uniform)")
 
             # Pool fused protein tokens (respecting protein padding)
-            pooled = _masked_mean(fused, prot_pad)
+            pooled = masked_mean(fused, prot_pad)
 
         elif self.fusion_mode == "concat":
             # Simple concatenation: pool both then concat
-            pooled_prot = _masked_mean(prot_tokens, prot_pad)  # [B, 512]
-            pooled_comp = _masked_mean(comp_tokens, comp_pad)  # [B, 512]
+            pooled_prot = masked_mean(prot_tokens, prot_pad)  # [B, 512]
+            pooled_comp = masked_mean(comp_tokens, comp_pad)  # [B, 512]
             pooled = torch.cat([pooled_prot, pooled_comp], dim=-1)  # [B, 1024]
 
             if debug:
@@ -990,10 +970,10 @@ class ProteinCompoundClassifier(nn.Module):
                 need_weights=False,
                 average_attn_weights=True
             )
-            pooled = _masked_mean(fused, prot_pad)
+            pooled = masked_mean(fused, prot_pad)
         elif self.fusion_mode == "concat":
-            pooled_prot = _masked_mean(prot_tokens, prot_pad)
-            pooled_comp = _masked_mean(comp_tokens, comp_pad)
+            pooled_prot = masked_mean(prot_tokens, prot_pad)
+            pooled_comp = masked_mean(comp_tokens, comp_pad)
             pooled = torch.cat([pooled_prot, pooled_comp], dim=-1)
 
         logits = self.classifier(pooled).squeeze(-1)
@@ -1011,35 +991,46 @@ def build_model(
     mlp_hidden: int,
     tuning_mode: str,
     fusion_mode: str = "xattn",
+    use_precomputed_embeddings: bool = True,
     manual_compound_features: bool = False,
     manual_protein_features: bool = False,
-) -> ProteinCompoundClassifier:
-    freeze_encoders = tuning_mode == "head"
-    if manual_protein_features:
-        protein_encoder = ManualProteinEncoder(normalize=True)
-    else:
-        protein_encoder = ProteinEncoderESM(
-            esm_root=esm_root,
-            model_name=esm_model,
-            checkpoint_path=esm_checkpoint,
-            freeze=freeze_encoders,
+) -> nn.Module:
+    if use_precomputed_embeddings:
+        return LightweightProteinCompoundClassifier(
+            prot_emb_dim=1280,
+            comp_emb_dim=300,
+            hidden_dim=hidden_dim,
+            num_heads=num_heads,
+            mlp_hidden=mlp_hidden,
+            fusion_mode=fusion_mode,
         )
-    if manual_compound_features:
-        compound_encoder = ManualCompoundEncoder(normalize=True)
     else:
-        compound_encoder = DrugChatCompoundEncoder(
-            drugchat_root=drugchat_root,
-            gnn_checkpoint=gnn_checkpoint,
-            freeze=freeze_encoders,
+        freeze_encoders = tuning_mode == "head"
+        if manual_protein_features:
+            protein_encoder = ManualProteinEncoder(normalize=True)
+        else:
+            protein_encoder = ProteinEncoderESM(
+                esm_root=esm_root,
+                model_name=esm_model,
+                checkpoint_path=esm_checkpoint,
+                freeze=freeze_encoders,
+            )
+        if manual_compound_features:
+            compound_encoder = ManualCompoundEncoder(normalize=True)
+        else:
+            compound_encoder = DrugChatCompoundEncoder(
+                drugchat_root=drugchat_root,
+                gnn_checkpoint=gnn_checkpoint,
+                freeze=freeze_encoders,
+            )
+        return ProteinCompoundClassifier(
+            protein_encoder=protein_encoder,
+            compound_encoder=compound_encoder,
+            hidden_dim=hidden_dim,
+            num_heads=num_heads,
+            mlp_hidden=mlp_hidden,
+            fusion_mode=fusion_mode,
         )
-    return ProteinCompoundClassifier(
-        protein_encoder=protein_encoder,
-        compound_encoder=compound_encoder,
-        hidden_dim=hidden_dim,
-        num_heads=num_heads,
-        mlp_hidden=mlp_hidden,
-        fusion_mode=fusion_mode,
-    )
 
 
 def configure_tuning(
@@ -1053,19 +1044,19 @@ def configure_tuning(
     lora_targets_compound: List[str],
 ) -> None:
     if tuning_mode == "full":
-        _set_requires_grad(model, True)
+        set_requires_grad(model, True)
         if hasattr(model.protein_encoder, "freeze"):
             model.protein_encoder.freeze = False
         if hasattr(model.compound_encoder, "freeze"):
             model.compound_encoder.freeze = False
         return
 
-    _set_requires_grad(model, False)
-    _set_requires_grad(model.proj_protein, True)
-    _set_requires_grad(model.proj_compound, True)
+    set_requires_grad(model, False)
+    set_requires_grad(model.proj_protein, True)
+    set_requires_grad(model.proj_compound, True)
     if model.cross_attn is not None:
-        _set_requires_grad(model.cross_attn, True)
-    _set_requires_grad(model.classifier, True)
+        set_requires_grad(model.cross_attn, True)
+    set_requires_grad(model.classifier, True)
 
     if tuning_mode == "lora":
         if hasattr(model.protein_encoder, "freeze"):
@@ -1073,7 +1064,7 @@ def configure_tuning(
         if hasattr(model.compound_encoder, "freeze"):
             model.compound_encoder.freeze = False
         if hasattr(model.protein_encoder, "model"):
-            model.protein_encoder.model = _apply_lora(
+            model.protein_encoder.model = apply_lora(
                 model.protein_encoder.model,
                 lora_targets_protein,
                 lora_r,
@@ -1082,7 +1073,7 @@ def configure_tuning(
                 lora_bias,
             )
         if hasattr(model.compound_encoder, "gnn"):
-            model.compound_encoder.gnn = _apply_lora(
+            model.compound_encoder.gnn = apply_lora(
                 model.compound_encoder.gnn,
                 lora_targets_compound,
                 lora_r,
@@ -1108,9 +1099,6 @@ def load_hf_datasets(
     print(f"Using HuggingFace dataset: {hf_dataset_path}")
     if not os.path.exists(hf_dataset_path):
         raise FileNotFoundError(f"HuggingFace dataset not found: {hf_dataset_path}")
-
-    from datasets import load_from_disk
-    import random
 
     full_dataset = load_from_disk(hf_dataset_path)
     num_cached_samples = len(full_dataset)
@@ -1192,7 +1180,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument(
+        "--num-steps",
+        type=int,
+        required=True,
+        help="Total number of training steps (optimizer updates, not batches)."
+    )
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument(
         "--optimizer",
@@ -1205,7 +1198,18 @@ def main() -> None:
     parser.add_argument("--momentum", type=float, default=0.9, help="Momentum for SGD optimizer (ignored for AdamW).")
     parser.add_argument("--train-split", type=float, default=0.8)
     parser.add_argument("--seed", type=int, default=13)
-    parser.add_argument("--eval-train", action="store_true")
+    parser.add_argument(
+        "--log-steps",
+        type=int,
+        default=50,
+        help="Log training metrics (batch loss, grad norms, LR) to wandb every N steps."
+    )
+    parser.add_argument(
+        "--eval-steps",
+        type=int,
+        default=None,
+        help="Run validation every N steps. If None, defaults to num_steps // 10 (10%% of training)."
+    )
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging.")
     parser.add_argument("--wandb-project", default="protein-compound")
     parser.add_argument("--wandb-entity", default=None)
@@ -1280,6 +1284,12 @@ def main() -> None:
         help="Path to HuggingFace dataset directory (created by convert_to_hf_dataset.py).",
     )
     parser.add_argument(
+        "--use-precomputed-embeddings",
+        action="store_true",
+        default=True,
+        help="Use precomputed embeddings from HF dataset (lightweight model). If False, compute embeddings on-the-fly (full model with encoders).",
+    )
+    parser.add_argument(
         "--num-workers",
         type=int,
         default=4,
@@ -1298,9 +1308,16 @@ def main() -> None:
     print(f"Dataset limits: max_train_samples={args.max_train_samples if args.max_train_samples is not None else 'None (no limit)'}, max_val_samples={args.max_val_samples}", flush=True)
 
     wandb_run = None
-    wandb_module = None
     if args.wandb:
-        wandb_run, wandb_module = _init_wandb(args)
+        tags = parse_list(args.wandb_tags)
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_run_name,
+            mode=args.wandb_mode,
+            tags=tags if tags else None,
+            config=vars(args),
+        )
 
     model = build_model(
         drugchat_root=args.drugchat_root,
@@ -1313,35 +1330,48 @@ def main() -> None:
         mlp_hidden=args.mlp_hidden,
         tuning_mode=args.tuning_mode,
         fusion_mode=args.fusion_mode,
+        use_precomputed_embeddings=args.use_precomputed_embeddings,
         manual_compound_features=False,
         manual_protein_features=False,
     )
-    print(
-        "protein_encoder=esm "
-        f"model={args.esm_model} checkpoint={args.esm_checkpoint} (encoders not used, embeddings precomputed)",
-        flush=True,
-    )
-    print(
-        f"compound_encoder=drugchat gnn_checkpoint={args.gnn_checkpoint} (encoders not used, embeddings precomputed)",
-        flush=True,
-    )
-    print(f"fusion_mode={args.fusion_mode}", flush=True)
-    if args.flash_attn:
-        _apply_sdpa_to_esm(model.protein_encoder.model)
-    if args.grad_checkpoint:
-        _enable_gradient_checkpointing_esm(model.protein_encoder.model)
-        model.compound_encoder.enable_gradient_checkpointing()
-        _enable_gradient_checkpointing_cross_attn(model)
-    configure_tuning(
-        model,
-        tuning_mode=args.tuning_mode,
-        lora_r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        lora_bias=args.lora_bias,
-        lora_targets_protein=_parse_list(args.lora_targets_protein),
-        lora_targets_compound=_parse_list(args.lora_targets_compound),
-    )
+    if args.use_precomputed_embeddings:
+        print(
+            f"model=LightweightProteinCompoundClassifier "
+            f"(no encoders, precomputed embeddings) "
+            f"fusion_mode={args.fusion_mode}",
+            flush=True,
+        )
+    else:
+        print(
+            "protein_encoder=esm "
+            f"model={args.esm_model} checkpoint={args.esm_checkpoint}",
+            flush=True,
+        )
+        print(
+            f"compound_encoder=drugchat gnn_checkpoint={args.gnn_checkpoint}",
+            flush=True,
+        )
+        print(f"fusion_mode={args.fusion_mode}", flush=True)
+    if not args.use_precomputed_embeddings:
+        if args.flash_attn:
+            apply_sdpa_to_esm(model.protein_encoder.model)
+        if args.grad_checkpoint:
+            enable_gradient_checkpointing_esm(model.protein_encoder.model)
+            model.compound_encoder.enable_gradient_checkpointing()
+            enable_gradient_checkpointing_cross_attn(model)
+    if not args.use_precomputed_embeddings:
+        configure_tuning(
+            model,
+            tuning_mode=args.tuning_mode,
+            lora_r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            lora_bias=args.lora_bias,
+            lora_targets_protein=parse_list(args.lora_targets_protein),
+            lora_targets_compound=parse_list(args.lora_targets_compound),
+        )
+    else:
+        print("model=lightweight tuning_mode=all_trainable", flush=True)
     device = torch.device(args.device)
     model.to(device)
     print("#Parameters:", sum(p.numel() for p in model.parameters()))
@@ -1370,8 +1400,8 @@ def main() -> None:
     )
 
     # Use HuggingFace collate function (precomputed embeddings)
-    collate_fn = _collate_hf_batch
-    use_precomputed_embeddings = True
+    collate_fn = collate_hf_batch
+    use_precomputed_embeddings = args.use_precomputed_embeddings
 
     train_loader = DataLoader(
         train_set,
@@ -1399,14 +1429,9 @@ def main() -> None:
           f"dataloader/pin_memory={True if device.type == 'cuda' else False} "
           f"dataloader/persistent_workers={True if args.num_workers > 0 else False}", flush=True)
 
-    # Calculate total training steps for scheduler
-    num_batches_per_epoch = len(train_loader)
-
-    steps_per_epoch = (num_batches_per_epoch + args.gradient_accumulation_steps - 1) // args.gradient_accumulation_steps
-    total_training_steps = steps_per_epoch * args.epochs
-    print(f"scheduler/num_batches_per_epoch={num_batches_per_epoch} "
-          f"scheduler/steps_per_epoch={steps_per_epoch} "
-          f"scheduler/total_training_steps={total_training_steps}")
+    # Total training steps is directly specified by user
+    total_training_steps = args.num_steps
+    print(f"scheduler/total_training_steps={total_training_steps}", flush=True)
 
     use_fp16 = args.amp == "fp16" and device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler() if use_fp16 else None
@@ -1484,62 +1509,116 @@ def main() -> None:
             config_update["momentum"] = args.momentum
         wandb_run.config.update(config_update)
 
-    for epoch in range(1, args.epochs + 1):
-        train_loss = train_epoch(
-            model, train_loader, optimizer, device, args.amp, scaler,
+    # Step-based training loop
+    global_step = 0
+    max_steps = args.num_steps
+
+    # Smart default for eval_steps if not specified
+    eval_steps = args.eval_steps
+    if eval_steps is None:
+        eval_steps = max(1, max_steps // 10)
+        print(f"eval_steps not specified, using smart default: {eval_steps} (10% of num_steps)", flush=True)
+
+    # Create infinite iterator over train_loader
+    train_iterator = iter(train_loader)
+    step_within_accumulation = 0
+
+    # Initialize optimizer state
+    optimizer.zero_grad(set_to_none=True)
+
+    # Progress bar
+    pbar = tqdm(total=max_steps, desc="Training")
+
+    print(f'Using precomputed embeddings: {use_precomputed_embeddings}', flush=True)
+
+    while global_step < max_steps:
+        # Get next batch (wrap around if needed)
+        try:
+            batch_data = next(train_iterator)
+        except StopIteration:
+            train_iterator = iter(train_loader)
+            batch_data = next(train_iterator)
+
+        # Single training step
+        loss, grad_norm = train_step(
+            model=model,
+            batch_data=batch_data,
+            optimizer=optimizer,
+            device=device,
+            amp_mode=args.amp,
+            scaler=scaler,
             accumulation_steps=args.gradient_accumulation_steps,
-            wandb_run=wandb_run,
+            step_within_accumulation=step_within_accumulation,
             grad_clip=args.grad_clip,
             scheduler=scheduler,
-            use_precomputed_embeddings=use_precomputed_embeddings)
-        test_loss, test_metrics = evaluate(
-            model, test_loader, device, args.amp,
-            use_precomputed_embeddings=use_precomputed_embeddings)
-        print('test metrics:', test_metrics)
-        metric_parts = [f"{k}={v:.4f}" for k, v in test_metrics.items()]
-        print(
-            f"epoch={epoch} train_loss={train_loss:.4f} "
-            f"test_loss={test_loss:.4f} {' '.join(metric_parts)}"
+            use_precomputed_embeddings=use_precomputed_embeddings,
         )
-        if wandb_run is not None:
-            log_data = {
-                "epoch": epoch,
-                "train/loss": train_loss,
-                "test/loss": test_loss,
-            }
 
-            # # add test_metrics to log_data
-            # for key, value in test_metrics.items():
-            #     log_data[f"test/{key}"] = value
+        # Update accumulation counter
+        step_within_accumulation = (step_within_accumulation + 1) % args.gradient_accumulation_steps
 
-            # Add memory metrics
-            if device.type == "cuda":
-                log_data["memory/allocated_gb"] = torch.cuda.memory_allocated(device) / 1024**3
-                log_data["memory/reserved_gb"] = torch.cuda.memory_reserved(device) / 1024**3
-                log_data["memory/peak_gb"] = torch.cuda.max_memory_allocated(device) / 1024**3
+        # Only increment global_step on optimizer update boundaries
+        if step_within_accumulation == 0:
+            global_step += 1
+            pbar.update(1)
 
-            for key, value in test_metrics.items():
-                print('adding test metric:', key, value)
-                log_data[f"test/{key}"] = value
-            wandb_run.log(log_data)
-        if args.eval_train:
-            train_eval_loss, train_metrics = evaluate(
-                model, train_loader, device, args.amp,
-                use_precomputed_embeddings=use_precomputed_embeddings)
-            train_parts = [f"{k}={v:.4f}" for k,
-                           v in train_metrics.items()]
-            print(
-                f"epoch={epoch} train_eval_loss={train_eval_loss:.4f} "
-                f"{' '.join(train_parts)}"
-            )
-            if wandb_run is not None:
+            # Logging every log_steps
+            if wandb_run is not None and global_step % args.log_steps == 0:
                 log_data = {
-                    "epoch": epoch,
-                    "train_eval/loss": train_eval_loss,
+                    "step": global_step,
+                    "train/batch_loss": loss,
+                    "train/learning_rate": optimizer.param_groups[0]['lr'],
                 }
-                for key, value in train_metrics.items():
-                    log_data[f"train_eval/{key}"] = value
+                # Add gradient norm if available (only on accumulation boundaries)
+                if grad_norm is not None:
+                    log_data["train/grad_norm"] = grad_norm
                 wandb_run.log(log_data)
+
+            # Validation every eval_steps
+            if global_step % eval_steps == 0:
+                val_loss, val_metrics = evaluate(
+                    model, test_loader, device, args.amp,
+                    use_precomputed_embeddings=use_precomputed_embeddings
+                )
+
+                metric_parts = [f"{k}={v:.4f}" for k, v in val_metrics.items()]
+                print(f"\nstep={global_step} val_loss={val_loss:.4f} {' '.join(metric_parts)}")
+
+                if wandb_run is not None:
+                    log_data = {
+                        "step": global_step,
+                        "val/loss": val_loss,
+                    }
+                    for key, value in val_metrics.items():
+                        log_data[f"val/{key}"] = value
+
+                    # Add memory metrics
+                    if device.type == "cuda":
+                        log_data["memory/allocated_gb"] = torch.cuda.memory_allocated(device) / 1024**3
+                        log_data["memory/reserved_gb"] = torch.cuda.memory_reserved(device) / 1024**3
+                    wandb_run.log(log_data)
+
+                model.train()  # Switch back to training mode
+
+    pbar.close()
+
+    # Final validation at end
+    print("\nRunning final validation...")
+    val_loss, val_metrics = evaluate(
+        model, test_loader, device, args.amp,
+        use_precomputed_embeddings=use_precomputed_embeddings
+    )
+    metric_parts = [f"{k}={v:.4f}" for k, v in val_metrics.items()]
+    print(f"final_step={global_step} val_loss={val_loss:.4f} {' '.join(metric_parts)}")
+
+    if wandb_run is not None:
+        log_data = {
+            "step": global_step,
+            "val/loss": val_loss,
+        }
+        for key, value in val_metrics.items():
+            log_data[f"val/{key}"] = value
+        wandb_run.log(log_data)
 
     if wandb_run is not None:
         wandb_run.finish()
