@@ -1567,7 +1567,7 @@ def main() -> None:
     # Smart default for eval_steps if not specified
     eval_steps = args.eval_steps
     if eval_steps is None:
-        eval_steps = max(1, max_steps // 10)
+        eval_steps = max(1, max_steps // 25)
         print(f"eval_steps not specified, using smart default: {eval_steps} (10% of num_steps)", flush=True)
 
     # Create infinite iterator over train_loader
@@ -1641,7 +1641,7 @@ def main() -> None:
                 }
                 for key, value in val_metrics.items():
                     log_data[f"val/{key}"] = value
-                    
+
                 wandb.log(log_data, step=global_step)
 
                 model.train()  # Switch back to training mode

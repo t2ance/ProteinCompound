@@ -2,10 +2,12 @@
 """
 Reduce protein and compound embedding dimensions using PCA.
 
-Protein: 1280 → 32 dimensions
-Compound: 300 → 32 dimensions
+Protein: 1280 → k dimensions
+Compound: 300 → k dimensions
 
 Memory-efficient implementation for very large datasets.
+
+nohup python reduce_embeddings.py > reduce_embeddings.log 2>&1 &
 """
 import numpy as np
 from sklearn.decomposition import IncrementalPCA
@@ -15,13 +17,13 @@ import random
 
 # Paths
 input_path = "/home/peijia/projects/ProteinCompound/cache/embeddings_hf"
-output_path = "/home/peijia/projects/ProteinCompound/cache/embeddings_reduce"
+output_path = "/home/peijia/projects/ProteinCompound/cache/embeddings_reduce_64_32"
 
 # PCA parameters
-PROT_TARGET_DIM = 32  # Reduce from 1280 to 32
-COMP_TARGET_DIM = 32  # Reduce from 300 to 32
+PROT_TARGET_DIM = 64  # Reduce from 1280 to k
+COMP_TARGET_DIM = 32  # Reduce from 300 to k
 FIT_SAMPLE_SIZE = 10000  # Number of samples to use for fitting PCA
-FIT_BATCH_SIZE = 50  # Process 50 samples at a time for fitting (memory-efficient)
+FIT_BATCH_SIZE = 100  # Process 2000 samples at a time for fitting (with 73GB RAM available)
 
 print("=" * 80)
 print("PCA Dimensionality Reduction for Protein-Compound Embeddings")
@@ -59,23 +61,19 @@ for batch_idx in tqdm(range(num_batches), desc="  Fitting PCA"):
     end_idx = min(start_idx + FIT_BATCH_SIZE, len(fit_indices))
     batch_indices = fit_indices[start_idx:end_idx]
 
-    # Process samples one by one to avoid loading too much at once
-    prot_sequences = []
-    comp_sequences = []
+    # Load batch at once for better performance
+    batch_samples = dataset.select(batch_indices)
+    prot_sequences = [emb for sample in batch_samples['prot_emb'] for emb in sample]
+    comp_sequences = [emb for sample in batch_samples['comp_emb'] for emb in sample]
 
-    for idx in batch_indices:
-        sample = dataset[idx]
-        prot_sequences.extend(sample['prot_emb'])
-        comp_sequences.extend(sample['comp_emb'])
-
-    # Partial fit PCA models (only loads current batch into memory)
+    # Partial fit PCA models
     if prot_sequences:
         prot_pca.partial_fit(np.array(prot_sequences, dtype=np.float32))
-        del prot_sequences  # Free memory immediately
+        del prot_sequences
 
     if comp_sequences:
         comp_pca.partial_fit(np.array(comp_sequences, dtype=np.float32))
-        del comp_sequences  # Free memory immediately
+        del comp_sequences
 
 # Print variance explained
 prot_var_explained = np.sum(prot_pca.explained_variance_ratio_) * 100
@@ -111,13 +109,13 @@ def transform_batch(batch):
         'label': batch['label'],
     }
 
-# Apply transformation using batched processing (memory-efficient)
+# Apply transformation using batched processing (leverage 96 CPU cores)
 reduced_dataset = dataset.map(
     transform_batch,
     batched=True,
-    batch_size=100,  # Process 100 samples at a time
+    batch_size=500,  # Process 500 samples at a time
     desc="  Applying PCA",
-    num_proc=1,  # Single process to avoid memory issues
+    num_proc=64,  # Use 64 cores out of 96 available
 )
 
 # Step 5: Save reduced dataset
